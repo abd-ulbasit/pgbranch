@@ -1,0 +1,38 @@
+# pgbranch Phase 5 — Future-Work Completion Plan
+
+> **For agentic workers:** TDD task-by-task. Decisions binding; named tests are the contract. Push to origin after each task's commit (`git push`).
+
+**Goal:** ship the README "Future work" items: TLS for the router (+API), Postgres version matrix, branch-from-branch (layer DAG), CSI multi-node storage mode.
+
+**Architecture decisions (locked):**
+
+1. **TLS (router + API).** branchd flags `--pg-tls-cert/--pg-tls-key` and `--api-tls-cert/--api-tls-key` (both optional pairs; one without the other = startup error). Router: when configured, answer SSLRequest with `'S'` and wrap the conn via `tls.Server` before reading the startup message (handle the case of a second SSLRequest after wrap = error). Without certs, current `'N'` behavior unchanged. Backend dials stay plaintext (local/cluster-internal). API: `http.Server.ListenAndServeTLS` equivalent on the existing listener (`tls.NewListener`). pgproxy gets `TLSConfig *tls.Config` field. Tests: self-signed cert generated in-test (crypto/x509), unit: SSLRequest→'S'→TLS handshake→startup routes; pgx `sslmode=require` integration through the proxy; API client against https with InsecureSkipVerify in-test. CLI/apiclient: accept https base URLs (already do — verify) + `PGBRANCH_TLS_SKIP_VERIFY=1` env escape hatch for self-signed (client.go opt).
+2. **Postgres version matrix.** Engine already derives images from `sources.pg_version`. Add: (a) validation — `pg_version` must be one of 14–18 (registry-level check + API 400 + CLI error); (b) matrix IT `internal/engine/matrix_it_test.go` gated `PGBRANCH_MATRIX_IT=1`: loops versions from env `PGBRANCH_MATRIX_VERSIONS` (default "14 18"), runs compact seed→branch→verify→destroy per version (parallel-safe names `mx<ver>-*`); (c) `make matrix`; (d) docs: support matrix table in README + docs/quickstart.md (14–18 supported; syncfs flag requires ≥14 — that's why 13 and older are unsupported). Run the matrix IT for real with 14 and 18 before committing docs claims.
+3. **Branch-from-branch (layer DAG).** The marquee feature.
+   - **Registry v5:** `layers(id TEXT PK, source_id TEXT NOT NULL, volume TEXT NOT NULL, parent_layer_id TEXT NULL REFERENCES layers(id))` + `branches.base_layer_id TEXT NULL` (NULL = branch directly off the source volume, as today) + `branches.parent_branch_name TEXT NOT NULL DEFAULT ''` (display only). Chain resolution: branch → base layer → parent layers… → source volume; expose `registry.LayerChain(branchID) ([]Layer, error)` (ordered topmost-first). Layer refcounts computed by query (count branches whose chain contains the layer), not stored.
+   - **Freeze semantics (overlay):** `CreateBranchFrom(ctx, name, parentBranch, ttl)`: parent must be `ready`. Steps: CHECKPOINT on parent (pgx via host/port — use Exec psql -c CHECKPOINT in-container instead, no password needed); stop parent container; create layer row L from parent's current rw volume; parent gets FRESH rw volume; parent restarts with lowers = [L, …old chain…, source] (new container, port may change — registry updated; proxy resolves live so existing `dbname@parent` connections just reconnect); child gets fresh rw volume with the same lowers = [L, …, source]. Saga with compensations (on failure: parent restored to its original rw volume and chain — the layer row is only committed after both restarts succeed; failure mid-way must put parent back `ready` or `failed`, never half-frozen). Entrypoint/PGBRANCH_LOWERS already accept colon lists (`/pgbranch/lower0/...:/pgbranch/lower1:...`); mounts: lower0 = source volume (path suffix `/data`), lowerN (N≥1) = layer volumes mounted at `/pgbranch/lowerN` with the *upper* content at the volume root — note: frozen rw volumes contain `upper/`, `work/`, `entrypoint.sh`; the overlay lower path for a frozen layer is `<mount>/upper`. Order in lowerdir: NEWEST first, source LAST.
+   - **ZFS mode:** natural — snapshot parent clone + clone it (`zfs snapshot br-parent@br-child` + clone). No freeze/restart needed (block-level). Planner already structured for this; implement both, with mode-specific saga paths.
+   - **destroy/GC:** destroying a branch destroys its rw; layers with zero remaining references are GC'd (volume removed, row deleted) — recursive up the chain while refcount hits zero. `RemoveSource` refuses while layers exist (or GC's orphan layers with zero refs).
+   - **Reset:** resets to the branch's OWN base chain (re-clone from base layer chain), not to source.
+   - **TTL/reaper:** unchanged (works on any branch).
+   - **API/CLI:** `POST /v1/branches` gains optional `parent` (mutually exclusive with `source`, 400 if both/neither); `pgb branch create NAME --from <source>` OR `--from-branch <branch>`; `pgb branch ls` shows PARENT column; UI create form gets a parent dropdown + tree indentation in the table (parent_branch_name).
+   - **Tests:** registry v5 migration + chain queries; engine fake-driver sagas (freeze ordering: checkpoint→stop→swap→restart-parent→start-child; failure unwind restores parent; GC refcounts incl. grandchild chains); Docker IT: source→b1→write marker to b1→branch b2 from b1→b2 sees marker, b1 keeps working, source untouched; destroy b1 (b2 survives — layer keeps it alive); destroy b2 (layer GC'd). Benchmarks doc gets a short "branch-from-branch" note (measure create p50 once at 1 GiB).
+4. **CSI multi-node storage (kube).** New kube storage mode: `--kube-storage hostpath|csi` (+ `--csi-storage-class`, `--csi-snapshot-class`). CSI mode: source "volume" = PVC (seed writes into it via helper pod with PVC mount); branch = new PVC with `dataSource: {kind: PersistentVolumeClaim, name: <source-pvc>}` (CSI clone — CoW on capable drivers) or via VolumeSnapshot when `--csi-snapshot-class` set (snapshot→PVC dataSource VolumeSnapshot). Branch pods mount the cloned PVC directly — **no overlay, no SYS_ADMIN, no node pinning** (this is the multi-node payoff; use the zfs-style direct entrypoint). Branch-from-branch in CSI = clone the parent's PVC (brief parent stop for crash-consistency, no freeze/layer machinery — PVC clones are independent). Driver: KubeDriver gains a storage strategy interface (hostPath strategy = current behavior, untouched); PVC strategy implements CreateVolume/RemoveVolume/mount translation. Unit tests: PVC spec construction (dataSource clone + snapshot variants), pod spec without SYS_ADMIN. IT gated `PGBRANCH_CSI_IT=1`: hack/kind-csi-up.sh installs csi-driver-host-path (supports clones/snapshots in kind) + snapshot CRDs/controller; e2e seed→branch→verify→destroy. If the csi-hostpath install proves unstable, the IT may be marked experimental with exact repro steps in docs — but ATTEMPT it first and report honestly.
+5. **Docs/README:** Future-work line replaced by shipped features; architecture.md updated (layer DAG diagram, CSI mode, TLS); docs/quickstart.md TLS example; bump roadmap "Phase 5 ✅". Final: tag `v0.2.0`, `gh release create` with generated notes summarizing measured numbers.
+
+---
+
+### Task A: TLS (decision 1)
+Commit: `feat(tls): optional TLS for the wire router and REST API`
+
+### Task B: version matrix (decision 2; REAL matrix run 14+18)
+Commit: `feat: postgres 14–18 support matrix, validated`
+
+### Task C: branch-from-branch layer DAG (decision 3)
+Commits: `feat(registry): v5 layer DAG`, `feat(engine): branch-from-branch with frozen layers`, `feat(api,cli,ui): parent branches`
+
+### Task D: CSI storage mode (decision 4)
+Commits: `feat(kube): csi storage strategy — multi-node branches`, (+ IT/install script)
+
+### Task E: docs + release (decision 5)
+Commit: `docs: phase 5 complete`, then tag v0.2.0 + GitHub release.
