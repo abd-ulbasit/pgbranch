@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -101,6 +102,29 @@ func tlsConfigFromFlags(certFile, keyFile, name string) (*tls.Config, error) {
 		return nil, fmt.Errorf("load --%s-tls-cert/--%s-tls-key: %w", name, name, err)
 	}
 	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
+}
+
+// pgProxyExposedPlaintext reports whether the Postgres router would carry
+// traffic (including credentials) in cleartext across the network: TLS is off
+// (no cert) AND the listen address is not loopback. A loopback-only listener,
+// or any TLS-terminated one, is fine. A malformed address is treated as exposed
+// (conservative: warn rather than stay silent). Pulled out as a pure function
+// so the loopback decision is unit-testable without standing up a listener.
+func pgProxyExposedPlaintext(pgAddr string, tlsEnabled bool) bool {
+	if tlsEnabled {
+		return false
+	}
+	host, _, err := net.SplitHostPort(pgAddr)
+	if err != nil {
+		return true // can't prove it's loopback -> assume exposed
+	}
+	if host == "" {
+		return true // ":6432" binds all interfaces
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !ip.IsLoopback()
+	}
+	return host != "localhost"
 }
 
 // storageOptions captures the --runtime/--kube-storage/--cow flag triangle
@@ -360,6 +384,10 @@ func run() error {
 	lis, err := net.Listen("tcp", *pgAddr)
 	if err != nil {
 		return fmt.Errorf("pg router listen: %w", err)
+	}
+	if pgProxyExposedPlaintext(*pgAddr, pgTLS != nil) {
+		slog.Warn("Postgres router is exposed without TLS: client traffic — including credentials — crosses the network in cleartext; set --pg-tls-cert/--pg-tls-key or bind --pg-addr to loopback and front it with a trusted TLS boundary",
+			"pg_addr", *pgAddr)
 	}
 	g.Go(func() error {
 		log.Printf("pg router listening on %s (connect with dbname@branch; TLS %v)", *pgAddr, pgTLS != nil)
