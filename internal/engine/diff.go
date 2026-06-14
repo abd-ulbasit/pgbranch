@@ -115,7 +115,7 @@ func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption
 		BaseLayerID:  b.BaseLayerID,
 		ExpiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
 	}
-	if err := e.reg.CreateBranch(tw); err != nil {
+	if err := e.reg.CreateBranchCtx(ctx, tw); err != nil {
 		return nil, fmt.Errorf("diff %q: %w", name, err)
 	}
 	// Best-effort teardown on every path; a failure leaves a TTL'd row the
@@ -126,7 +126,7 @@ func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption
 	}()
 	if err := e.provision(ctx, tw, src); err != nil {
 		e.logCompensationErr("transition", "diff: mark throwaway base branch failed after provision failed",
-			e.reg.TransitionBranch(tw.ID, registry.BranchFailed, err.Error()), "branch", tw.Name, "branch_id", tw.ID)
+			e.reg.TransitionBranchCtx(ctx, tw.ID, registry.BranchFailed, err.Error()), "branch", tw.Name, "branch_id", tw.ID)
 		return nil, fmt.Errorf("diff %q: provision base clone: %w", name, err)
 	}
 	twRow, err := e.reg.GetBranchByName(tw.Name)

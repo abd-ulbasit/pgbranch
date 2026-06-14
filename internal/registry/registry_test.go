@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -165,8 +166,8 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 10 {
-		t.Fatalf("user_version=%d want 10", v)
+	if v != 11 {
+		t.Fatalf("user_version=%d want 11", v)
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
@@ -228,6 +229,20 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	// v9: api_tokens table exists and is usable on the upgraded DB
 	if _, err := r.CreateAPIToken("ci", RoleOperator); err != nil {
 		t.Fatalf("v9 api_tokens unusable after upgrade: %v", err)
+	}
+	// v11: transitions.actor column exists; the pre-existing branch's "created"
+	// journal row (written by schemaV1 fixture? no — fixture inserts no
+	// transitions) is absent, but a fresh transition records the actor column.
+	if err := r.TransitionBranchCtx(WithActor(context.Background(), Actor{Name: "ci", Role: RoleOperator}),
+		"br1", BranchDestroying, "audit upgrade check"); err != nil {
+		t.Fatalf("v11 transition after upgrade: %v", err)
+	}
+	var actor string
+	if err := r.db.QueryRow(`SELECT actor FROM transitions WHERE entity_id='br1' ORDER BY id DESC LIMIT 1`).Scan(&actor); err != nil {
+		t.Fatalf("v11 actor column read: %v", err)
+	}
+	if actor != "ci (operator)" {
+		t.Fatalf("v11 actor=%q want %q", actor, "ci (operator)")
 	}
 	// re-opening an already-migrated DB is a no-op
 	r2, err := Open(path)

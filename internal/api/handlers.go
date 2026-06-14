@@ -329,6 +329,25 @@ func (s *Server) branchDiff(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// branchHistory returns a branch's audit trail: every recorded state
+// transition with its reason, the actor that caused it, and the timestamp,
+// oldest first. Role-gated at viewer. 404 if the name was never used.
+func (s *Server) branchHistory(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.reg.BranchHistory(r.PathValue("name"))
+	if err != nil {
+		writeEngineError(w, r, err)
+		return
+	}
+	out := make([]Transition, 0, len(rows))
+	for _, t := range rows {
+		out = append(out, Transition{
+			FromState: t.FromState, ToState: t.ToState,
+			Reason: t.Reason, Actor: t.Actor, At: t.At,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) destroyBranch(w http.ResponseWriter, r *http.Request) {
 	if err := s.eng.DestroyBranch(r.Context(), r.PathValue("name")); err != nil {
 		writeEngineError(w, r, err)

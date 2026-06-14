@@ -251,7 +251,7 @@ func (e *Engine) applyAction(ctx context.Context, a Action) (applied bool, err e
 		} else if err := e.removeBranchLayer(ctx, b); err != nil {
 			slog.Warn("reconcile: remove stuck branch layer failed", "branch", b.Name, "rw_volume", b.RWVolume, "err", err)
 		}
-		if err := e.reg.TransitionBranch(b.ID, registry.BranchFailed, "reconcile: stuck "+string(b.State)); err != nil {
+		if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, "reconcile: stuck "+string(b.State)); err != nil {
 			return false, err
 		}
 		return true, nil

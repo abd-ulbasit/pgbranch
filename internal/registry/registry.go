@@ -253,7 +253,7 @@ func (r *Registry) CreateSource(s *Source) error {
 	if err != nil {
 		return fmt.Errorf("create source %q: %w", s.Name, err)
 	}
-	return r.journal("source", s.ID, "", string(SourceSeeding), "created")
+	return r.journal(context.Background(), "source", s.ID, "", string(SourceSeeding), "created")
 }
 
 func (r *Registry) SetSourceState(id string, to SourceState, reason string) error {
@@ -271,12 +271,12 @@ func (r *Registry) setState(table, entity, id, to, reason string) error {
 	if _, err := r.db.Exec(`UPDATE `+table+` SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, to, id); err != nil {
 		return err
 	}
-	return r.journal(entity, id, from, to, reason)
+	return r.journal(context.Background(), entity, id, from, to, reason)
 }
 
-func (r *Registry) journal(entity, id, from, to, reason string) error {
-	_, err := r.db.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason) VALUES (?,?,?,?,?)`,
-		entity, id, from, to, reason)
+func (r *Registry) journal(ctx context.Context, entity, id, from, to, reason string) error {
+	_, err := r.db.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
+		entity, id, from, to, reason, actorString(ctx))
 	return err
 }
 
@@ -322,14 +322,23 @@ func nullable(s string) any {
 	return s
 }
 
+// CreateBranch inserts a new branch row (state creating) and journals the
+// initial transition with the system actor. Use CreateBranchCtx to record the
+// request actor that initiated the create.
 func (r *Registry) CreateBranch(b *Branch) error {
+	return r.CreateBranchCtx(context.Background(), b)
+}
+
+// CreateBranchCtx is CreateBranch with the actor read from ctx (see WithActor)
+// stamped onto the initial "created" transition.
+func (r *Registry) CreateBranchCtx(ctx context.Context, b *Branch) error {
 	b.ID, b.State = newID(), BranchCreating
 	_, err := r.db.Exec(`INSERT INTO branches (id,name,source_id,state,rw_volume,source_volume,expires_at,base_layer_id,parent_branch_name) VALUES (?,?,?,?,?,?,?,?,?)`,
 		b.ID, b.Name, b.SourceID, b.State, b.RWVolume, b.SourceVolume, b.ExpiresAt, nullable(b.BaseLayerID), b.ParentBranchName)
 	if err != nil {
 		return fmt.Errorf("create branch %q: %w", b.Name, err)
 	}
-	return r.journal("branch", b.ID, "", string(BranchCreating), "created")
+	return r.journal(ctx, "branch", b.ID, "", string(BranchCreating), "created")
 }
 
 // TransitionBranch atomically moves a branch into `to`, but only from a legal
@@ -343,6 +352,15 @@ func (r *Registry) CreateBranch(b *Branch) error {
 // journal from_state and the not-found/illegal distinction), then apply a
 // state-guarded conditional UPDATE so the swap can never lose a concurrent race.
 func (r *Registry) TransitionBranch(id string, to BranchState, reason string) error {
+	return r.TransitionBranchCtx(context.Background(), id, to, reason)
+}
+
+// TransitionBranchCtx is TransitionBranch with the actor read from ctx (see
+// WithActor) recorded in the transitions journal's actor column. The engine
+// threads the request context here so create/destroy/reset record WHO did it;
+// daemon-initiated transitions (reconcile, GC) pass a context with no actor and
+// record SystemActor.
+func (r *Registry) TransitionBranchCtx(ctx context.Context, id string, to BranchState, reason string) error {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return err
@@ -390,9 +408,9 @@ func (r *Registry) TransitionBranch(id string, to BranchState, reason string) er
 	}
 
 	// CAS won: journal the transition in the same tx, with the exact prior
-	// state and identical columns/values to setState's journal.
-	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason) VALUES (?,?,?,?,?)`,
-		"branch", id, from, string(to), reason); err != nil {
+	// state, the actor from ctx, and identical columns/values to setState's journal.
+	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
+		"branch", id, from, string(to), reason, actorString(ctx)); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -457,10 +475,16 @@ func (r *Registry) TouchBranch(id string) error {
 }
 
 func (r *Registry) MarkBranchReady(id, containerID, host string, port int) error {
+	return r.MarkBranchReadyCtx(context.Background(), id, containerID, host, port)
+}
+
+// MarkBranchReadyCtx is MarkBranchReady with the actor read from ctx recorded
+// on the creating/resetting -> ready transition.
+func (r *Registry) MarkBranchReadyCtx(ctx context.Context, id, containerID, host string, port int) error {
 	if _, err := r.db.Exec(`UPDATE branches SET container_id=?, host=?, port=? WHERE id=?`, containerID, host, port, id); err != nil {
 		return err
 	}
-	return r.TransitionBranch(id, BranchReady, "instance running")
+	return r.TransitionBranchCtx(ctx, id, BranchReady, "instance running")
 }
 
 const branchCols = `id,name,source_id,state,container_id,rw_volume,source_volume,expires_at,host,base_layer_id,parent_branch_name,password,port,created_at`
@@ -500,6 +524,49 @@ func (r *Registry) GetBranchByName(name string) (*Branch, error) {
 
 func (r *Registry) ListLiveBranches() ([]*Branch, error) {
 	return r.listBranches(`state!='destroyed'`)
+}
+
+// Transition is one row of the branch audit log: a recorded state change, the
+// reason, the actor (token name + role, the env-token sentinel, or SystemActor
+// for daemon-initiated changes), and when it happened.
+type Transition struct {
+	FromState string `json:"from_state"`
+	ToState   string `json:"to_state"`
+	Reason    string `json:"reason"`
+	Actor     string `json:"actor"`
+	At        string `json:"at"`
+}
+
+// BranchHistory returns the audit trail for every branch that has ever borne
+// the given name, oldest first. It joins transitions to the branch rows by
+// id (a destroyed-then-recreated name maps to multiple ids), so an incident on
+// a since-recreated name is still recoverable. ErrNotFound when the name was
+// never used.
+func (r *Registry) BranchHistory(name string) ([]Transition, error) {
+	rows, err := r.db.Query(`SELECT t.from_state, t.to_state, t.reason, t.actor, t.at
+		FROM transitions t
+		JOIN branches b ON b.id = t.entity_id AND t.entity = 'branch'
+		WHERE b.name = ?
+		ORDER BY t.id ASC`, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Transition
+	for rows.Next() {
+		var t Transition
+		if err := rows.Scan(&t.FromState, &t.ToState, &t.Reason, &t.Actor, &t.At); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, ErrNotFound
+	}
+	return out, nil
 }
 
 // ListExpiredBranches returns ready/failed branches whose expiry (RFC3339
@@ -819,6 +886,12 @@ func (r *Registry) CountBranchesReferencingLayer(layerID string) (int, error) {
 //
 // The parent must be mid-freeze (resetting); all of it commits or none does.
 func (r *Registry) CommitFreeze(parentID, childID, layerVolume, newParentRW, containerID, host string, port int, reason string) (*Layer, error) {
+	return r.CommitFreezeCtx(context.Background(), parentID, childID, layerVolume, newParentRW, containerID, host, port, reason)
+}
+
+// CommitFreezeCtx is CommitFreeze with the actor read from ctx recorded on the
+// parent's resetting -> ready freeze-commit transition.
+func (r *Registry) CommitFreezeCtx(ctx context.Context, parentID, childID, layerVolume, newParentRW, containerID, host string, port int, reason string) (*Layer, error) {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return nil, err
@@ -846,8 +919,8 @@ func (r *Registry) CommitFreeze(parentID, childID, layerVolume, newParentRW, con
 		newParentRW, l.ID, containerID, host, port, BranchReady, parentID); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason) VALUES (?,?,?,?,?)`,
-		"branch", parentID, state, string(BranchReady), reason); err != nil {
+	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
+		"branch", parentID, state, string(BranchReady), reason, actorString(ctx)); err != nil {
 		return nil, err
 	}
 	res, err := tx.Exec(`UPDATE branches SET base_layer_id=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, l.ID, childID)

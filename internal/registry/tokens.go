@@ -76,6 +76,21 @@ func (r *Registry) LookupAPIToken(plaintext string) (string, bool) {
 	return role, true
 }
 
+// LookupAPITokenActor resolves a presented plaintext token to its stored
+// name and role via the same indexed point lookup as LookupAPIToken. The audit
+// log uses the name to record WHO performed a branch mutation. Returns ("", "",
+// false) for the empty token, an unknown token, or any query error.
+func (r *Registry) LookupAPITokenActor(plaintext string) (name, role string, ok bool) {
+	if plaintext == "" {
+		return "", "", false
+	}
+	err := r.db.QueryRow(`SELECT name, role FROM api_tokens WHERE token_hash=?`, hashToken(plaintext)).Scan(&name, &role)
+	if err != nil {
+		return "", "", false
+	}
+	return name, role, true
+}
+
 // ListAPITokens returns token metadata (name/role/created_at) ordered by
 // creation. It never returns the token plaintext or its hash.
 func (r *Registry) ListAPITokens() ([]APIToken, error) {

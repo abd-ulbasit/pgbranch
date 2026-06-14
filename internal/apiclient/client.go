@@ -258,6 +258,14 @@ func (c *Client) DiffBranch(ctx context.Context, name string, dataSample int) (*
 	return &out, nil
 }
 
+// BranchHistory fetches a branch's audit trail: every recorded state
+// transition with its reason, the actor that caused it, and the timestamp,
+// oldest first. Backs `pgb history` in server mode.
+func (c *Client) BranchHistory(ctx context.Context, name string) ([]api.Transition, error) {
+	var out []api.Transition
+	return out, c.do(ctx, "GET", "/v1/branches/"+url.PathEscape(name)+"/history", nil, &out)
+}
+
 func (c *Client) DestroyBranch(ctx context.Context, name string) error {
 	return c.do(ctx, "DELETE", "/v1/branches/"+url.PathEscape(name), nil, nil)
 }

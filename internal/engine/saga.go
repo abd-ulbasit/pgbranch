@@ -90,12 +90,12 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 		Name: name, SourceID: src.ID, RWVolume: e.planner.BranchLayerName(name),
 		SourceVolume: src.Volume, ExpiresAt: expiresAt,
 	}
-	if err := e.reg.CreateBranch(b); err != nil {
+	if err := e.reg.CreateBranchCtx(ctx, b); err != nil {
 		return nil, err
 	}
 	if err := e.provision(ctx, b, src); err != nil {
 		e.logCompensationErr("transition", "create: mark branch failed after provision failed",
-			e.reg.TransitionBranch(b.ID, registry.BranchFailed, err.Error()), "branch", b.Name, "branch_id", b.ID)
+			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, err.Error()), "branch", b.Name, "branch_id", b.ID)
 		return nil, err
 	}
 	return e.reg.GetBranchByName(name)
@@ -324,7 +324,7 @@ func (e *Engine) awaitAndMark(ctx context.Context, b *registry.Branch, src *regi
 	if err != nil {
 		return err
 	}
-	return e.reg.MarkBranchReady(b.ID, cid, info.Host, info.Port)
+	return e.reg.MarkBranchReadyCtx(ctx, b.ID, cid, info.Host, info.Port)
 }
 
 // rotateBranchCredentials gives a fresh/reset branch its own password: a
@@ -406,12 +406,12 @@ func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Bran
 	if err != nil {
 		return nil, err
 	}
-	if err := e.reg.TransitionBranch(b.ID, registry.BranchResetting, "reset requested"); err != nil {
+	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchResetting, "reset requested"); err != nil {
 		return nil, err
 	}
 	fail := func(stepErr error) (*registry.Branch, error) {
 		e.logCompensationErr("transition", "reset: mark branch failed after reset step failed",
-			e.reg.TransitionBranch(b.ID, registry.BranchFailed, stepErr.Error()), "branch", b.Name, "branch_id", b.ID)
+			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, stepErr.Error()), "branch", b.Name, "branch_id", b.ID)
 		return nil, stepErr
 	}
 	if b.ContainerID != "" {
@@ -508,11 +508,11 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	// fast-paths what reconcile would eventually do.
 	forcedFromTransient := b.State == registry.BranchCreating || b.State == registry.BranchResetting
 	if forcedFromTransient {
-		if err := e.reg.TransitionBranch(b.ID, registry.BranchFailed, "destroy requested: forcing stuck "+string(b.State)); err != nil {
+		if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, "destroy requested: forcing stuck "+string(b.State)); err != nil {
 			return err
 		}
 	}
-	if err := e.reg.TransitionBranch(b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
+	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
 		return err
 	}
 	if b.ContainerID != "" {
@@ -544,7 +544,7 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	} else if err := e.removeBranchLayer(ctx, b); err != nil {
 		return fmt.Errorf("remove branch layer: %w", err)
 	}
-	if err := e.reg.TransitionBranch(b.ID, registry.BranchDestroyed, ""); err != nil {
+	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchDestroyed, ""); err != nil {
 		return err
 	}
 	// the destroyed branch may have been the last reference to its frozen

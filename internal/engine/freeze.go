@@ -63,7 +63,7 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 		// and destroy all operate on it naturally.
 		child.SourceVolume = parent.RWVolume
 	}
-	if err := e.reg.CreateBranch(child); err != nil {
+	if err := e.reg.CreateBranchCtx(ctx, child); err != nil {
 		return nil, err
 	}
 	provision := func() error { return e.freezeAndProvision(ctx, child, parent, src) }
@@ -75,7 +75,7 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	}
 	if err := provision(); err != nil {
 		e.logCompensationErr("transition", "from_branch: mark child failed after provision failed",
-			e.reg.TransitionBranch(child.ID, registry.BranchFailed, err.Error()), "branch", child.Name, "branch_id", child.ID)
+			e.reg.TransitionBranchCtx(ctx, child.ID, registry.BranchFailed, err.Error()), "branch", child.Name, "branch_id", child.ID)
 		return nil, err
 	}
 	return e.reg.GetBranchByName(name)
@@ -99,7 +99,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	childPlan := cow.PlanBranch(child.RWVolume, child.SourceVolume, frozen)
 	image := e.image(src.PGVersion)
 
-	if err := e.reg.TransitionBranch(parent.ID, registry.BranchResetting, "freeze for child "+child.Name); err != nil {
+	if err := e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchResetting, "freeze for child "+child.Name); err != nil {
 		return err
 	}
 	bg := context.WithoutCancel(ctx)
@@ -108,7 +108,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	// needing minimal WAL replay (in-container psql, no password needed).
 	if err := e.drv.Exec(ctx, parent.ContainerID, psqlCmd(src, "CHECKPOINT")); err != nil {
 		e.logCompensationErr("transition", "freeze: restore parent to ready after checkpoint failed",
-			e.reg.TransitionBranch(parent.ID, registry.BranchReady, "freeze for child "+child.Name+" aborted: checkpoint failed"),
+			e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchReady, "freeze for child "+child.Name+" aborted: checkpoint failed"),
 			"branch", parent.Name, "branch_id", parent.ID)
 		return fmt.Errorf("checkpoint parent %q: %w", parent.Name, err)
 	}
@@ -119,7 +119,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	if err := e.drv.StopRemove(ctx, parent.ContainerID); err != nil {
 		// container state unknown — don't guess; reconcile/destroy can clean
 		e.logCompensationErr("transition", "freeze: mark parent failed after stop parent failed",
-			e.reg.TransitionBranch(parent.ID, registry.BranchFailed, "freeze for child "+child.Name+": stop parent failed: "+err.Error()),
+			e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchFailed, "freeze for child "+child.Name+": stop parent failed: "+err.Error()),
 			"branch", parent.Name, "branch_id", parent.ID)
 		return fmt.Errorf("stop parent %q: %w", parent.Name, err)
 	}
@@ -215,14 +215,14 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	// 6. commit: the old rw volume becomes a layer, the parent swaps onto the
 	// fresh one (resetting -> ready, new container/port), the child bases on
 	// the new layer — one transaction
-	if _, err := e.reg.CommitFreeze(parent.ID, child.ID, parent.RWVolume, newRW,
+	if _, err := e.reg.CommitFreezeCtx(ctx, parent.ID, child.ID, parent.RWVolume, newRW,
 		parentCID, parentInfo.Host, parentInfo.Port, "freeze for child "+child.Name+" complete"); err != nil {
 		return fail(fmt.Errorf("commit freeze: %w", err))
 	}
 
 	// 7. child ready (post-commit registry failures leave the child failed
 	// for destroy/reconcile; the freeze itself is already consistent)
-	return e.reg.MarkBranchReady(child.ID, childCID, childInfo.Host, childInfo.Port)
+	return e.reg.MarkBranchReadyCtx(ctx, child.ID, childCID, childInfo.Host, childInfo.Port)
 }
 
 // restoreParent puts a parent back on its original rw volume and chain after
@@ -232,7 +232,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 func (e *Engine) restoreParent(ctx context.Context, parent *registry.Branch, src *registry.Source, origPlan cow.Plan, cause error) {
 	failed := func(err error) {
 		e.logCompensationErr("transition", "restoreParent: mark parent failed after restore failed",
-			e.reg.TransitionBranch(parent.ID, registry.BranchFailed,
+			e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchFailed,
 				fmt.Sprintf("freeze failed (%v); parent restore failed: %v", cause, err)),
 			"branch", parent.Name, "branch_id", parent.ID)
 	}
@@ -257,5 +257,5 @@ func (e *Engine) restoreParent(ctx context.Context, parent *registry.Branch, src
 		return
 	}
 	e.logCompensationErr("transition", "restoreParent: mark parent ready after restore",
-		e.reg.MarkBranchReady(parent.ID, cid, info.Host, info.Port), "branch", parent.Name, "branch_id", parent.ID)
+		e.reg.MarkBranchReadyCtx(ctx, parent.ID, cid, info.Host, info.Port), "branch", parent.Name, "branch_id", parent.ID)
 }

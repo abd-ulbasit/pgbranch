@@ -72,8 +72,8 @@ func TestMigrationV10IndexExists(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 10 {
-		t.Fatalf("user_version = %d, want 10", version)
+	if version < 10 {
+		t.Fatalf("user_version = %d, want >= 10 (the api_tokens_hash index migration)", version)
 	}
 	var name string
 	err := r.db.QueryRow(
