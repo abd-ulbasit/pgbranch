@@ -94,10 +94,19 @@ type payload struct {
 	} `json:"installation"`
 }
 
+// maxWebhookBody caps the request body read BEFORE signature verification so
+// an unauthenticated multi-GB POST can't exhaust memory. GitHub payloads are
+// well under 1 MiB.
+const maxWebhookBody = 1 << 20
+
 func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	// Limit before reading and before HMAC verification: the read itself is
+	// the attack surface. ReadAll on an over-limit body returns an error (and
+	// MaxBytesReader writes a 413 to w), so we reject without buffering it all.
+	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "read body: "+err.Error(), http.StatusRequestEntityTooLarge)
 		return
 	}
 	if !verifySignature(s.cfg.WebhookSecret, body, r.Header.Get("X-Hub-Signature-256")) {

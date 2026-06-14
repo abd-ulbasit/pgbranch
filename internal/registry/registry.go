@@ -91,7 +91,24 @@ type Layer struct {
 
 type Registry struct {
 	db         *sql.DB
-	instanceID string // stable per-registry id; tags managed resources for GC scoping
+	instanceID string     // stable per-registry id; tags managed resources for GC scoping
+	secrets    *secretBox // at-rest encryption for branch passwords; nil = plaintext (no key configured)
+}
+
+// SetSecretKey enables at-rest encryption of branch passwords with the given
+// 32-byte key (derive it from PGBRANCH_TOKEN via DeriveSecretKey). Call it once
+// right after Open, before serving. A nil/empty key is a no-op, leaving the
+// registry in plaintext mode (inherit-mode setups and tests need no key). A
+// wrong-length key is a configuration error and is returned. Once set,
+// SetBranchPassword encrypts before write and every read path decrypts, while
+// legacy plaintext rows still read back unchanged.
+func (r *Registry) SetSecretKey(key []byte) error {
+	box, err := newSecretBox(key)
+	if err != nil {
+		return err
+	}
+	r.secrets = box
+	return nil
 }
 
 func Open(path string) (*Registry, error) {
@@ -395,7 +412,15 @@ func legalBranchTransition(from, to BranchState) bool {
 // credentials inherited from the source). Called by the engine after the
 // in-branch ALTER ROLE succeeded, before the branch is marked ready.
 func (r *Registry) SetBranchPassword(id, password string) error {
-	res, err := r.db.Exec(`UPDATE branches SET password=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, password, id)
+	// Encrypt at rest when a key is configured: the registry file lives on a
+	// hostPath/PVC, so a plaintext password column hands every live branch's
+	// working credential to anyone who can read the file. With no key set the
+	// stored value is the plaintext (back-compat / inherit-mode / tests).
+	stored, err := r.secrets.encrypt(password)
+	if err != nil {
+		return fmt.Errorf("encrypt branch password: %w", err)
+	}
+	res, err := r.db.Exec(`UPDATE branches SET password=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, stored, id)
 	if err != nil {
 		return err
 	}
@@ -440,20 +465,33 @@ func (r *Registry) MarkBranchReady(id, containerID, host string, port int) error
 
 const branchCols = `id,name,source_id,state,container_id,rw_volume,source_volume,expires_at,host,base_layer_id,parent_branch_name,password,port,created_at`
 
-func scanBranch(row interface{ Scan(...any) error }) (*Branch, error) {
+// scanBranch reads a branch row, decrypting the password column on the way out
+// so callers (API, engine) always see plaintext. It is a *Registry method
+// because decryption needs the registry's secret key; the stored value carries
+// the enc: prefix iff it was encrypted, so legacy plaintext rows pass through.
+func (r *Registry) scanBranch(row interface{ Scan(...any) error }) (*Branch, error) {
 	b := &Branch{}
 	var baseLayer sql.NullString
+	var storedPassword string
 	err := row.Scan(&b.ID, &b.Name, &b.SourceID, &b.State, &b.ContainerID, &b.RWVolume,
-		&b.SourceVolume, &b.ExpiresAt, &b.Host, &baseLayer, &b.ParentBranchName, &b.Password, &b.Port, &b.CreatedAt)
+		&b.SourceVolume, &b.ExpiresAt, &b.Host, &baseLayer, &b.ParentBranchName, &storedPassword, &b.Port, &b.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
+	if err != nil {
+		return nil, err
+	}
 	b.BaseLayerID = baseLayer.String
-	return b, err
+	pw, derr := decryptColumn(r.secrets, storedPassword)
+	if derr != nil {
+		return nil, derr
+	}
+	b.Password = pw
+	return b, nil
 }
 
 func (r *Registry) getBranch(where string, args ...any) (*Branch, error) {
-	return scanBranch(r.db.QueryRow(`SELECT `+branchCols+` FROM branches WHERE `+where, args...))
+	return r.scanBranch(r.db.QueryRow(`SELECT `+branchCols+` FROM branches WHERE `+where, args...))
 }
 
 func (r *Registry) GetBranchByName(name string) (*Branch, error) {
@@ -485,7 +523,7 @@ func (r *Registry) ListStuckBranches(before string) ([]*Branch, error) {
 	defer rows.Close()
 	var out []*Branch
 	for rows.Next() {
-		b, err := scanBranch(rows)
+		b, err := r.scanBranch(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -543,7 +581,7 @@ func (r *Registry) listBranches(where string, args ...any) ([]*Branch, error) {
 	defer rows.Close()
 	var out []*Branch
 	for rows.Next() {
-		b, err := scanBranch(rows)
+		b, err := r.scanBranch(rows)
 		if err != nil {
 			return nil, err
 		}

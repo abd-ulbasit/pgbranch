@@ -350,6 +350,14 @@ func (e *Engine) rotateBranchCredentials(ctx context.Context, cid string, b *reg
 	// the role name is identifier-quoted; the password is pure hex, so the
 	// literal needs no escaping
 	stmt := fmt.Sprintf(`ALTER ROLE "%s" WITH PASSWORD '%s'`, strings.ReplaceAll(user, `"`, `""`), pw)
+	// S-2 (audit-log exposure): the rotated password is passed as a `psql -c`
+	// argv element, so it appears in container/k8s exec audit logs. Feeding the
+	// SQL on stdin instead would keep it out of argv, but runtime.Driver only
+	// exposes Exec/ExecOutput (no stdin) — adding a stdin variant means changing
+	// the interface and both the Docker and Kube drivers, an invasive change for
+	// a bounded leak. The exposure is bounded: this same password is also stored
+	// (now encrypted at rest), is re-rotated on every reset, and belongs to an
+	// ephemeral branch. Left as-is deliberately; revisit if a stdin exec lands.
 	if err := e.drv.Exec(ctx, cid, psqlCmd(src, stmt)); err != nil {
 		return fmt.Errorf("rotate credentials for branch %q: %w", b.Name, err)
 	}

@@ -765,6 +765,157 @@ func TestBranchPasswordRoundTrip(t *testing.T) {
 	}
 }
 
+// rawBranchPassword reads the password column straight from SQLite, bypassing
+// scanBranch's decrypt, so a test can assert the on-disk value is ciphertext.
+func rawBranchPassword(t *testing.T, r *Registry, id string) string {
+	t.Helper()
+	var pw string
+	if err := r.db.QueryRow(`SELECT password FROM branches WHERE id=?`, id).Scan(&pw); err != nil {
+		t.Fatal(err)
+	}
+	return pw
+}
+
+func makeBranch(t *testing.T, r *Registry, name string) *Branch {
+	t.Helper()
+	src, err := r.GetSourceByName("main")
+	if err != nil {
+		src = &Source{Name: "main", PGVersion: "17", Volume: "v"}
+		if err := r.CreateSource(src); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := &Branch{Name: name, SourceID: src.ID, RWVolume: "rw-" + name, SourceVolume: "v"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// With a key set, SetBranchPassword encrypts on write (raw column is enc:-prefixed
+// ciphertext, not the plaintext) and every read path decrypts back to the
+// original plaintext.
+func TestBranchPasswordEncryptedAtRest(t *testing.T) {
+	r := openTest(t)
+	if err := r.SetSecretKey(DeriveSecretKey("super-secret-token")); err != nil {
+		t.Fatal(err)
+	}
+	b := makeBranch(t, r, "pr-1")
+	const plain = "deadbeefcafef00d"
+	if err := r.SetBranchPassword(b.ID, plain); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := rawBranchPassword(t, r, b.ID)
+	if raw == plain {
+		t.Fatalf("raw column stored plaintext %q; want ciphertext", raw)
+	}
+	if !strings.HasPrefix(raw, encPrefix) {
+		t.Fatalf("raw column %q missing %q prefix", raw, encPrefix)
+	}
+
+	got, err := r.GetBranchByName("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Password != plain {
+		t.Fatalf("GetBranchByName Password=%q want %q", got.Password, plain)
+	}
+	live, err := r.ListLiveBranches()
+	if err != nil || len(live) != 1 || live[0].Password != plain {
+		t.Fatalf("ListLiveBranches password=%v err=%v want %q", live, err, plain)
+	}
+}
+
+// With no key, behavior is unchanged: the password is stored and read as
+// plaintext (back-compat for inherit-mode setups and existing tests).
+func TestBranchPasswordPlaintextWithoutKey(t *testing.T) {
+	r := openTest(t)
+	b := makeBranch(t, r, "pr-1")
+	const plain = "a1b2c3d4"
+	if err := r.SetBranchPassword(b.ID, plain); err != nil {
+		t.Fatal(err)
+	}
+	if raw := rawBranchPassword(t, r, b.ID); raw != plain {
+		t.Fatalf("no-key raw column=%q want plaintext %q", raw, plain)
+	}
+	if got, _ := r.GetBranchByName("pr-1"); got.Password != plain {
+		t.Fatalf("no-key read Password=%q want %q", got.Password, plain)
+	}
+}
+
+// A legacy plaintext row (written before encryption, or while no key was set)
+// reads back correctly even after a key is configured: the missing enc: prefix
+// marks it plaintext, so it never double-encrypts or fails to decrypt.
+func TestBranchPasswordLegacyPlaintextReadWithKey(t *testing.T) {
+	r := openTest(t)
+	b := makeBranch(t, r, "pr-1")
+	const legacy = "legacyplaintext0"
+	if err := r.SetBranchPassword(b.ID, legacy); err != nil { // no key yet -> plaintext
+		t.Fatal(err)
+	}
+	// Operator now sets a key (e.g. PGBRANCH_TOKEN configured after an upgrade).
+	if err := r.SetSecretKey(DeriveSecretKey("token-set-later")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.GetBranchByName("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Password != legacy {
+		t.Fatalf("legacy row read with key Password=%q want %q", got.Password, legacy)
+	}
+}
+
+// Empty passwords (inherit mode) stay empty whether or not a key is set, and
+// never grow an enc: prefix.
+func TestBranchPasswordEmptyStaysEmpty(t *testing.T) {
+	r := openTest(t)
+	if err := r.SetSecretKey(DeriveSecretKey("tok")); err != nil {
+		t.Fatal(err)
+	}
+	b := makeBranch(t, r, "pr-1")
+	if got, _ := r.GetBranchByName("pr-1"); got.Password != "" {
+		t.Fatalf("fresh branch Password=%q want empty", got.Password)
+	}
+	if raw := rawBranchPassword(t, r, b.ID); raw != "" {
+		t.Fatalf("empty password raw column=%q want empty", raw)
+	}
+}
+
+// A wrong-length key is rejected at SetSecretKey.
+func TestSetSecretKeyRejectsBadLength(t *testing.T) {
+	r := openTest(t)
+	if err := r.SetSecretKey([]byte("short")); err == nil {
+		t.Fatal("want error for 5-byte key")
+	}
+	// nil key is the no-op (plaintext) path, not an error
+	if err := r.SetSecretKey(nil); err != nil {
+		t.Fatalf("nil key should be a no-op, got %v", err)
+	}
+}
+
+// A value encrypted under one token cannot be decrypted after the token (and
+// thus the derived key) is rotated — surfaces as a decrypt error, not silent
+// corruption. Documents the rotation trade-off at the unit level.
+func TestBranchPasswordUnrecoverableAfterTokenRotation(t *testing.T) {
+	r := openTest(t)
+	if err := r.SetSecretKey(DeriveSecretKey("old-token")); err != nil {
+		t.Fatal(err)
+	}
+	b := makeBranch(t, r, "pr-1")
+	if err := r.SetBranchPassword(b.ID, "secretpw12345678"); err != nil {
+		t.Fatal(err)
+	}
+	// token rotated: key no longer matches the stored ciphertext
+	if err := r.SetSecretKey(DeriveSecretKey("new-token")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.GetBranchByName("pr-1"); err == nil {
+		t.Fatal("want decrypt error reading a password encrypted under the old token")
+	}
+}
+
 func TestCreateBranchPersistsParentBranchName(t *testing.T) {
 	r := openTest(t)
 	src := &Source{Name: "main", PGVersion: "17", Volume: "v"}

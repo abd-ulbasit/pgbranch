@@ -161,6 +161,120 @@ func fakeBackend(t *testing.T, fn func(conn net.Conn, be *pgproto3.Backend, sm *
 	return lis.Addr().(*net.TCPAddr).Port
 }
 
+// A client that connects and then sends nothing must be dropped once the
+// startup read deadline fires, freeing the goroutine+fd. With a short timeout
+// the proxy closes the conn and our read returns EOF promptly.
+func TestStartupReadDeadlineDropsSilentClient(t *testing.T) {
+	p := New(fakeResolver{})
+	p.StartupTimeout = 150 * time.Millisecond
+	addr := startProxyWith(t, p)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	// Never write a startup frame. Give our own read a generous deadline so it
+	// is the *server* timeout that ends the connection, not ours.
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 1)
+	start := time.Now()
+	n, err := conn.Read(buf)
+	if n != 0 || err == nil {
+		t.Fatalf("read = (%d, %v), want (0, server-closed error)", n, err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("connection lingered %v; startup deadline did not fire", elapsed)
+	}
+}
+
+// The connection cap is honored: with MaxConns=1 and one connection fully
+// established in a relay (holding the only slot), a second connection is
+// refused fast — the proxy closes it right after accept, so the client's read
+// returns promptly with a closed-connection error, not at its own deadline.
+func TestConnectionCapRefusesPastMax(t *testing.T) {
+	// Backend that authenticates then keeps the relay open (slot stays held).
+	port := fakeBackend(t, func(conn net.Conn, be *pgproto3.Backend, sm *pgproto3.StartupMessage) {
+		be.Send(&pgproto3.AuthenticationOk{})
+		be.Flush()
+		io.Copy(io.Discard, conn) // hold the connection open
+	})
+	p := New(fakeResolver{"pr-1": local(port)})
+	p.MaxConns = 1
+	addr := startProxyWith(t, p)
+
+	// Conn #1 completes startup and enters the relay, occupying the only slot.
+	c1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c1.Close() })
+	c1.SetReadDeadline(time.Now().Add(3 * time.Second))
+	fe1 := pgproto3.NewFrontend(c1, c1)
+	sendStartup(t, fe1, map[string]string{"user": "postgres", "database": "postgres@pr-1"})
+	if _, err := fe1.Receive(); err != nil { // AuthenticationOk: relay is live
+		t.Fatalf("conn #1 never reached relay: %v", err)
+	}
+
+	// Conn #2 should be accepted then immediately closed (cap full). Its read
+	// must return well before its own 2s deadline.
+	c2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c2.Close() })
+	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1)
+	start := time.Now()
+	n, err := c2.Read(buf)
+	if n != 0 || err == nil {
+		t.Fatalf("second conn read = (%d, %v), want (0, closed-by-cap error)", n, err)
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("second conn lingered %v; cap did not refuse it fast", elapsed)
+	}
+}
+
+// Once relaying, a session that goes quiet in both directions for longer than
+// IdleTimeout is torn down. The backend stays connected but silent after the
+// initial handshake; with a short idle timeout the client's relayed read ends.
+func TestRelayIdleTimeoutClosesQuietSession(t *testing.T) {
+	port := fakeBackend(t, func(conn net.Conn, be *pgproto3.Backend, sm *pgproto3.StartupMessage) {
+		be.Send(&pgproto3.AuthenticationOk{})
+		be.Flush()
+		// Then go silent and just hold the connection open.
+		io.Copy(io.Discard, conn)
+	})
+	p := New(fakeResolver{"pr-1": local(port)})
+	p.IdleTimeout = 200 * time.Millisecond
+	addr := startProxyWith(t, p)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	fe := pgproto3.NewFrontend(conn, conn)
+	sendStartup(t, fe, map[string]string{"user": "postgres", "database": "postgres@pr-1"})
+	if msg, err := fe.Receive(); err != nil {
+		t.Fatalf("first receive: %v", err)
+	} else if _, ok := msg.(*pgproto3.AuthenticationOk); !ok {
+		t.Fatalf("got %T, want *AuthenticationOk", msg)
+	}
+
+	// No more traffic either way: the idle timeout should close the relay and
+	// surface EOF/closed to the next client read. Our own deadline is generous.
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	start := time.Now()
+	if _, err := fe.Receive(); err == nil {
+		t.Fatal("expected the idle relay to close the session")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("session lingered %v; idle timeout did not fire", elapsed)
+	}
+}
+
 func TestSplitDatabase(t *testing.T) {
 	tests := []struct {
 		in, db, branch string

@@ -231,6 +231,15 @@ func run() error {
 		return err
 	}
 	defer reg.Close()
+	// Encrypt branch passwords at rest with a key derived from PGBRANCH_TOKEN
+	// (key = sha256(token)). The registry DB sits on a hostPath/PVC; without
+	// this a reader of the file gets every live branch's working credential.
+	// Trade-off: rotating PGBRANCH_TOKEN makes existing encrypted passwords
+	// unrecoverable — re-run credential rotation after a token change. (token
+	// is non-empty here: branchd refused to start above otherwise.)
+	if err := reg.SetSecretKey(registry.DeriveSecretKey(token)); err != nil {
+		return err
+	}
 	cowSet := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "cow" {
