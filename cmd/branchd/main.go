@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -55,6 +56,34 @@ func uiURL(apiAddr string, tlsEnabled bool) string {
 		host = "localhost"
 	}
 	return fmt.Sprintf("%s://%s/ui/", scheme, net.JoinHostPort(host, port))
+}
+
+// envInt reads an int env var as a flag default; an unset/empty var keeps def,
+// a malformed value is fatal so a typo'd cap can't silently disable the quota.
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Fatalf("invalid %s=%q: %v", key, v, err)
+	}
+	return n
+}
+
+// envDuration reads a Go-duration env var (e.g. "24h") as a flag default; an
+// unset/empty var keeps def, a malformed value is fatal.
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Fatalf("invalid %s=%q: %v", key, v, err)
+	}
+	return d
 }
 
 // tlsConfigFromFlags loads an optional PEM cert/key flag pair (--<name>-tls-cert
@@ -144,6 +173,9 @@ func run() error {
 	cowBackend := flag.String("cow", string(cow.BackendOverlay), "copy-on-write backend: overlay (default), zfs (experimental, see docs/zfs.md) or csi (forced by --kube-storage csi)")
 	zfsDataset := flag.String("zfs-dataset", "", "dataset prefix holding all pgbranch datasets, e.g. tank/pgbranch (required with --cow zfs)")
 	rotateCreds := flag.Bool("rotate-branch-credentials", false, "give every branch its own generated password instead of inheriting the source's (returned as `password` in branch API responses; see docs/architecture.md)")
+	maxBranches := flag.Int("max-branches", envInt("PGBRANCH_MAX_BRANCHES", 0), "cap on live (non-destroyed) branches; creates past the cap return 403 (0 = unlimited; env PGBRANCH_MAX_BRANCHES)")
+	defaultTTL := flag.Duration("default-ttl", envDuration("PGBRANCH_DEFAULT_TTL", 0), "TTL applied to branches created without one, e.g. 24h (0 = no default, branches never expire; env PGBRANCH_DEFAULT_TTL)")
+	maxTTL := flag.Duration("max-ttl", envDuration("PGBRANCH_MAX_TTL", 0), "upper bound on any requested branch TTL; longer TTLs are capped to this, e.g. 168h (0 = no cap; env PGBRANCH_MAX_TTL)")
 	apiTLSCert := flag.String("api-tls-cert", "", "PEM certificate for the REST API (TLS off when unset; requires --api-tls-key)")
 	apiTLSKey := flag.String("api-tls-key", "", "PEM private key for the REST API (requires --api-tls-cert)")
 	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
@@ -234,6 +266,18 @@ func run() error {
 	engOpts := []engine.Option{engine.WithMetrics(m)}
 	if *rotateCreds {
 		engOpts = append(engOpts, engine.WithCredentialRotation())
+	}
+	if *maxBranches < 0 {
+		return errors.New("--max-branches must be >= 0 (0 = unlimited)")
+	}
+	if *maxBranches > 0 {
+		engOpts = append(engOpts, engine.WithMaxBranches(*maxBranches))
+	}
+	if *defaultTTL < 0 || *maxTTL < 0 {
+		return errors.New("--default-ttl and --max-ttl must be >= 0 (0 = unset)")
+	}
+	if *defaultTTL > 0 || *maxTTL > 0 {
+		engOpts = append(engOpts, engine.WithTTLPolicy(*defaultTTL, *maxTTL))
 	}
 	eng := engine.NewWithPlanner(reg, drv, cfg.PostgresImage,
 		cow.Planner{Backend: backend, Dataset: strings.Trim(*zfsDataset, "/")}, engOpts...)

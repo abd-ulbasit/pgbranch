@@ -613,6 +613,15 @@ func (r *Registry) BumpSourceGeneration(id, newVolume string) error {
 	return nil
 }
 
+// CountLiveBranches counts every branch that is not destroyed (creating,
+// resetting, ready, failed and destroying all count). branchd's --max-branches
+// quota compares this against its cap before provisioning a new branch.
+func (r *Registry) CountLiveBranches() (int, error) {
+	var n int
+	err := r.db.QueryRow(`SELECT count(*) FROM branches WHERE state!='destroyed'`).Scan(&n)
+	return n, err
+}
+
 func (r *Registry) CountLiveBranchesBySource(sourceID string) (int, error) {
 	var n int
 	err := r.db.QueryRow(`SELECT count(*) FROM branches WHERE source_id=? AND state!='destroyed'`, sourceID).Scan(&n)

@@ -24,8 +24,8 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 }
 
 // writeEngineError maps engine/registry failures to HTTP statuses: invalid
-// input -> 400, missing rows -> 404, name/lifecycle conflicts -> 409,
-// everything else -> 500.
+// input -> 400, missing rows -> 404, quota exceeded -> 403, name/lifecycle
+// conflicts -> 409, everything else -> 500.
 func writeEngineError(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	msg := err.Error()
@@ -35,6 +35,8 @@ func writeEngineError(w http.ResponseWriter, err error) {
 		code = http.StatusBadRequest
 	case errors.Is(err, registry.ErrNotFound):
 		code = http.StatusNotFound
+	case errors.Is(err, engine.ErrQuotaExceeded):
+		code = http.StatusForbidden
 	case strings.Contains(msg, "UNIQUE constraint"),
 		strings.Contains(msg, "live branch"),
 		strings.Contains(msg, "child branch"),

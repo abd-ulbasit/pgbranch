@@ -37,6 +37,9 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	if err := validateBranchName(name); err != nil {
 		return nil, err
 	}
+	if err := e.checkQuota(); err != nil {
+		return nil, err
+	}
 	parent, err := e.reg.GetBranchByName(parentName)
 	if err != nil {
 		return nil, fmt.Errorf("parent branch %q: %w", parentName, err)
@@ -48,10 +51,7 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	if err != nil {
 		return nil, err
 	}
-	expiresAt := ""
-	if ttl > 0 {
-		expiresAt = time.Now().Add(ttl).UTC().Format(time.RFC3339)
-	}
+	expiresAt := e.expiresAtFor(ttl)
 	child := &registry.Branch{
 		Name: name, SourceID: parent.SourceID, RWVolume: e.planner.BranchLayerName(name),
 		SourceVolume: parent.SourceVolume, ExpiresAt: expiresAt, ParentBranchName: parentName,

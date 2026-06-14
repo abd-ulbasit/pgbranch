@@ -57,6 +57,9 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 	if err := validateBranchName(name); err != nil {
 		return nil, err
 	}
+	if err := e.checkQuota(); err != nil {
+		return nil, err
+	}
 	src, err := e.reg.GetSourceByName(sourceName)
 	if err != nil {
 		return nil, fmt.Errorf("source %q: %w", sourceName, err)
@@ -64,10 +67,7 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 	if src.State != registry.SourceReady {
 		return nil, fmt.Errorf("source %q is %s, not ready", sourceName, src.State)
 	}
-	expiresAt := ""
-	if ttl > 0 {
-		expiresAt = time.Now().Add(ttl).UTC().Format(time.RFC3339)
-	}
+	expiresAt := e.expiresAtFor(ttl)
 	b := &registry.Branch{
 		Name: name, SourceID: src.ID, RWVolume: e.planner.BranchLayerName(name),
 		SourceVolume: src.Volume, ExpiresAt: expiresAt,
