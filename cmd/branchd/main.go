@@ -155,6 +155,21 @@ func resolveStorage(o storageOptions) (cow.Backend, error) {
 	}
 }
 
+// storageRoot returns the on-disk path whose filesystem holds all branch CoW
+// data and the SQLite registry, for the disk-free gauge. docker/overlay use
+// cfg.Home (~/.pgbranch); kube hostpath uses --kube-data-root on the storage
+// node. CSI has no single shared local root (one PVC per branch), so it returns
+// "" and the gauge is left unregistered.
+func storageRoot(runtimeName, kubeStorage, kubeDataRoot, home string) string {
+	if runtimeName == "kube" {
+		if kubeStorage == "hostpath" {
+			return kubeDataRoot
+		}
+		return "" // csi: no single shared root
+	}
+	return home // docker / overlay
+}
+
 func run() error {
 	apiAddr := flag.String("api-addr", ":7070", "REST API listen address")
 	pgAddr := flag.String("pg-addr", ":6432", "Postgres router listen address")
@@ -263,6 +278,14 @@ func run() error {
 	}
 	m := metrics.New()
 	m.SetStateCounter(reg)
+	// Disk-free visibility on the storage-root filesystem that holds all CoW
+	// branch volumes plus the SQLite registry. For docker/overlay that root is
+	// cfg.Home (~/.pgbranch); for kube hostpath it is --kube-data-root on the
+	// storage node. CSI gives each branch its own PVC with no single shared
+	// local root to statfs, so the gauge is wired only for the local-FS modes.
+	if diskRoot := storageRoot(*runtimeName, *kubeStorage, *kubeDataRoot, cfg.Home); diskRoot != "" {
+		m.SetDiskRoot(diskRoot)
+	}
 	engOpts := []engine.Option{engine.WithMetrics(m)}
 	if *rotateCreds {
 		engOpts = append(engOpts, engine.WithCredentialRotation())

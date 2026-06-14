@@ -99,6 +99,18 @@ func (m *Metrics) SetStateCounter(sc StateCounter) {
 	m.reg.MustRegister(newStateCollector(sc))
 }
 
+// SetDiskRoot registers the disk-free collector for the storage-root path
+// (the filesystem holding all branch CoW volumes plus the SQLite registry).
+// It reports pgbranch_disk_bytes_free / _total via statfs on every scrape, so
+// the values are always fresh. Call once at wire-up (branchd). No-op on a nil
+// receiver or an empty path.
+func (m *Metrics) SetDiskRoot(root string) {
+	if m == nil || root == "" {
+		return
+	}
+	m.reg.MustRegister(newDiskCollector(root))
+}
+
 // Handler serves the private registry over promhttp. Never nil-safe: callers
 // (branchd) always build a real Metrics for the API mux.
 func (m *Metrics) Handler() http.Handler {

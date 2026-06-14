@@ -112,6 +112,60 @@ pgbranch_compensation_failures_total{kind="cleanup"} 1
 	}
 }
 
+// TestDiskCollectorReportsFreeBytes asserts the disk-free collector registers
+// and reports a plausible (>0) free/total byte count for a real path (the test
+// temp dir). It avoids asserting an exact number, which is host-dependent.
+func TestDiskCollectorReportsFreeBytes(t *testing.T) {
+	m := New()
+	m.SetDiskRoot(t.TempDir())
+
+	mfs, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]float64{}
+	for _, mf := range mfs {
+		switch mf.GetName() {
+		case "pgbranch_disk_bytes_free", "pgbranch_disk_bytes_total":
+			ms := mf.GetMetric()
+			if len(ms) != 1 {
+				t.Fatalf("%s: got %d samples, want 1", mf.GetName(), len(ms))
+			}
+			got[mf.GetName()] = ms[0].GetGauge().GetValue()
+		}
+	}
+	free, okFree := got["pgbranch_disk_bytes_free"]
+	total, okTotal := got["pgbranch_disk_bytes_total"]
+	if !okFree || !okTotal {
+		t.Fatalf("missing disk gauges: %+v", got)
+	}
+	if free <= 0 {
+		t.Fatalf("pgbranch_disk_bytes_free=%v, want > 0", free)
+	}
+	if total <= 0 {
+		t.Fatalf("pgbranch_disk_bytes_total=%v, want > 0", total)
+	}
+	if free > total {
+		t.Fatalf("free (%v) > total (%v), implausible", free, total)
+	}
+}
+
+// TestSetDiskRootNoOpOnEmptyPath: an empty path must not register the collector
+// (and must not panic), so the disk gauges are simply absent.
+func TestSetDiskRootNoOpOnEmptyPath(t *testing.T) {
+	m := New()
+	m.SetDiskRoot("")
+	mfs, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if n := mf.GetName(); n == "pgbranch_disk_bytes_free" || n == "pgbranch_disk_bytes_total" {
+			t.Fatalf("disk gauge %s registered for empty root", n)
+		}
+	}
+}
+
 // All methods on a nil *Metrics must be no-ops (engine code calls them
 // unconditionally; tests build engines without metrics).
 func TestNilReceiverIsNoOp(t *testing.T) {
@@ -126,4 +180,5 @@ func TestNilReceiverIsNoOp(t *testing.T) {
 	m.DecInflight()
 	m.IncCompensationFailure("undo")
 	m.SetStateCounter(fakeStateCounter{})
+	m.SetDiskRoot("/")
 }
