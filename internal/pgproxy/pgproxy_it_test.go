@@ -142,11 +142,14 @@ func TestProxyIntegration(t *testing.T) {
 	if err == nil {
 		t.Fatal("connect to unknown branch should fail")
 	}
+	// The server message must be the generic refusal and must NOT distinguish
+	// not-found from not-ready (the enumeration signal C2 removed). (The DSN
+	// "postgres@nope" is echoed by pgx itself, not by our server message.)
 	if !strings.Contains(err.Error(), "database not available") {
 		t.Errorf("unknown-branch error %q lacks the generic refusal", err)
 	}
-	if strings.Contains(err.Error(), "nope") {
-		t.Errorf("unknown-branch error %q leaks the branch name (enumeration)", err)
+	if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not ready") {
+		t.Errorf("unknown-branch error %q leaks branch existence/state (enumeration)", err)
 	}
 
 	// TLS: a second proxy with a self-signed cert; pgx sslmode=require sends
