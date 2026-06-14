@@ -315,17 +315,80 @@ func (r *Registry) CreateBranch(b *Branch) error {
 	return r.journal("branch", b.ID, "", string(BranchCreating), "created")
 }
 
+// TransitionBranch atomically moves a branch into `to`, but only from a legal
+// source state. It is a compare-and-swap: a single conditional UPDATE guarded
+// by `WHERE id=? AND state IN (<legal from-states>)`, with the transitions
+// journal row written in the SAME transaction. This closes the TOCTOU window
+// the old read-check-write had — two racing transitions can no longer both
+// observe the same start state and both succeed; exactly one wins.
+//
+// Mirrors CommitFreeze: read the current state inside the tx (for an accurate
+// journal from_state and the not-found/illegal distinction), then apply a
+// state-guarded conditional UPDATE so the swap can never lose a concurrent race.
 func (r *Registry) TransitionBranch(id string, to BranchState, reason string) error {
-	b, err := r.getBranch(`id=?`, id)
+	tx, err := r.db.Begin()
 	if err != nil {
 		return err
 	}
-	for _, ok := range legalBranch[b.State] {
+	defer tx.Rollback()
+
+	var from string
+	if err := tx.QueryRow(`SELECT state FROM branches WHERE id=?`, id).Scan(&from); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if !legalBranchTransition(BranchState(from), to) {
+		return fmt.Errorf("illegal branch transition %s -> %s", from, to)
+	}
+
+	// Conditional UPDATE: the `state=?` guard makes this a compare-and-swap.
+	// It only fires while the row is STILL in the from-state we read above; a
+	// concurrent winner that moved the row out from under us makes
+	// RowsAffected()==0, so we never clobber its transition. (Under
+	// SetMaxOpenConns(1) the SELECT+UPDATE in this tx are already serialized,
+	// but the guard keeps the CAS correct regardless of connection pooling.)
+	res, err := tx.Exec(`UPDATE branches SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id=? AND state=?`, string(to), id, from)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// Lost the race: the row's state changed between our read and the
+		// UPDATE. Re-read and report the same illegal-transition error a
+		// from-state mismatch would have produced.
+		var cur string
+		if err := tx.QueryRow(`SELECT state FROM branches WHERE id=?`, id).Scan(&cur); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		return fmt.Errorf("illegal branch transition %s -> %s", cur, to)
+	}
+
+	// CAS won: journal the transition in the same tx, with the exact prior
+	// state and identical columns/values to setState's journal.
+	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason) VALUES (?,?,?,?,?)`,
+		"branch", id, from, string(to), reason); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// legalBranchTransition reports whether from -> to is permitted by legalBranch.
+func legalBranchTransition(from, to BranchState) bool {
+	for _, ok := range legalBranch[from] {
 		if ok == to {
-			return r.setState("branches", "branch", id, string(to), reason)
+			return true
 		}
 	}
-	return fmt.Errorf("illegal branch transition %s -> %s", b.State, to)
+	return false
 }
 
 // SetBranchPassword stores a branch's rotated per-branch password ("" =

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
@@ -455,6 +456,17 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	if err != nil {
 		return err
 	}
+	// Force a branch wedged in a transient state (creating/resetting) to failed
+	// first, so it can be destroyed now instead of waiting out the 10m
+	// stuck-timeout reconcile. creating->failed and resetting->failed are both
+	// legal (the same edges reconcile's fail-stuck path uses), so this just
+	// fast-paths what reconcile would eventually do.
+	forcedFromTransient := b.State == registry.BranchCreating || b.State == registry.BranchResetting
+	if forcedFromTransient {
+		if err := e.reg.TransitionBranch(b.ID, registry.BranchFailed, "destroy requested: forcing stuck "+string(b.State)); err != nil {
+			return err
+		}
+	}
 	if err := e.reg.TransitionBranch(b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
 		return err
 	}
@@ -463,7 +475,28 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 			return fmt.Errorf("remove container: %w", err)
 		}
 	}
-	if err := e.removeBranchLayer(ctx, b); err != nil {
+	// When we forced a branch out of a transient state, its rw volume may still
+	// be another live branch's data. A freeze parent forced out of 'resetting'
+	// keeps its live data in its rw volume until CommitFreeze; an in-flight child
+	// references that volume (as its source_volume, or by naming the parent).
+	// Removing it would be the A1 data-loss bug, so guard exactly like
+	// reconcile's ActionFailStuck. A normally-destroyed ready/failed branch is
+	// NOT guarded: a post-CommitFreeze parent has already swapped to a fresh rw
+	// volume (its old one is now a layer GC'd separately), and the
+	// parent_branch_name link would otherwise false-positive against that fresh
+	// volume.
+	if forcedFromTransient {
+		referenced, err := e.reg.CountLiveBranchesReferencingRW(b.Name, b.RWVolume)
+		if err != nil {
+			return err
+		}
+		if referenced > 0 {
+			slog.Warn("destroy: forced-stuck branch rw volume is live data for another branch; keeping the volume",
+				"branch", b.Name, "rw_volume", b.RWVolume, "referencing_branches", referenced)
+		} else if err := e.removeBranchLayer(ctx, b); err != nil {
+			return fmt.Errorf("remove branch layer: %w", err)
+		}
+	} else if err := e.removeBranchLayer(ctx, b); err != nil {
 		return fmt.Errorf("remove branch layer: %w", err)
 	}
 	if err := e.reg.TransitionBranch(b.ID, registry.BranchDestroyed, ""); err != nil {

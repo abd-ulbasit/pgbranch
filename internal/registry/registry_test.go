@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -1016,5 +1017,68 @@ func TestCountLiveBranchesReferencingRW(t *testing.T) {
 	}
 	if n, err := r.CountLiveBranchesReferencingRW(parent.Name, parent.RWVolume); err != nil || n != 0 {
 		t.Fatalf("n=%d err=%v want 0 after children destroyed", n, err)
+	}
+}
+
+// TestTransitionBranchIsAtomicCAS races two concurrent TransitionBranch calls
+// from the SAME legal start state (ready) to two DIFFERENT target states
+// (destroying vs resetting). The transition must be a compare-and-swap: exactly
+// one goroutine wins, the other gets the illegal-transition error (its legal
+// from-state no longer holds), and the row ends in the winner's state. A
+// non-atomic read-check-write would let both read 'ready' and both succeed,
+// leaving the journal and row inconsistent.
+func TestTransitionBranchIsAtomicCAS(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "v"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	b := &Branch{Name: "pr-1", SourceID: s.ID, RWVolume: "rw", SourceVolume: "v"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkBranchReady(b.ID, "c", "127.0.0.1", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		to  BranchState
+		err error
+	}
+	results := make(chan result, 2)
+	var start sync.WaitGroup
+	start.Add(1)
+	for _, to := range []BranchState{BranchDestroying, BranchResetting} {
+		to := to
+		go func() {
+			start.Wait() // release both goroutines together to maximise the race
+			results <- result{to: to, err: r.TransitionBranch(b.ID, to, "race")}
+		}()
+	}
+	start.Done()
+
+	var winners, losers int
+	var winState BranchState
+	for i := 0; i < 2; i++ {
+		res := <-results
+		if res.err == nil {
+			winners++
+			winState = res.to
+		} else {
+			losers++
+			if !strings.Contains(res.err.Error(), "illegal branch transition") {
+				t.Fatalf("loser err = %v, want illegal-transition error", res.err)
+			}
+		}
+	}
+	if winners != 1 || losers != 1 {
+		t.Fatalf("winners=%d losers=%d, want exactly one of each (CAS not atomic)", winners, losers)
+	}
+	got, err := r.getBranch(`id=?`, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != winState {
+		t.Fatalf("final state=%q, want winner's state %q", got.State, winState)
 	}
 }
