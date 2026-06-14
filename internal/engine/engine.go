@@ -170,6 +170,9 @@ func (e *Engine) seedSource(ctx context.Context, s *registry.Source, layer, pass
 
 // AddSource registers a source and seeds it from the given live Postgres.
 func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password string) error {
+	if err := validateSourceName(s.Name); err != nil {
+		return err
+	}
 	s.Volume = e.planner.SourceLayerName(s.Name, 1)
 	if err := e.reg.CreateSource(s); err != nil {
 		return err

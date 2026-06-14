@@ -834,6 +834,52 @@ func TestAddSourceBasebackupUnaffected(t *testing.T) {
 	}
 }
 
+// TestAddSourceRejectsUnsafeNames gates the ZFS path-injection sink: a source
+// name flows into volume/dataset names, so AddSource must reject anything that
+// is not [a-z0-9][a-z0-9-]{0,40}. The "../../rpool/ROOT" case is the actual
+// dataset-namespace-traversal payload.
+func TestAddSourceRejectsUnsafeNames(t *testing.T) {
+	bad := []struct{ name, value string }{
+		{"slash", "a/b"},
+		{"dotdot-traversal", "../../rpool/ROOT"},
+		{"uppercase", "Main"},
+		{"leading-hyphen", "-main"},
+		{"spaces", "my source"},
+		{"empty", ""},
+		{"overlength", strings.Repeat("a", 42)},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newFake()
+			e, r := testEngine(t, d)
+			s := &registry.Source{Name: tc.value, PGVersion: "17", ConnHost: "h", ConnPort: 5432, ConnUser: "postgres"}
+			err := e.AddSource(context.Background(), s, "secret")
+			if err == nil {
+				t.Fatalf("AddSource(%q) = nil, want rejection", tc.value)
+			}
+			if !errors.Is(err, ErrInvalidName) {
+				t.Fatalf("AddSource(%q) err = %v, want ErrInvalidName", tc.value, err)
+			}
+			// rejected at the boundary: nothing was created in the registry
+			if _, gerr := r.GetSourceByName(tc.value); gerr == nil {
+				t.Fatalf("AddSource(%q) created a source row despite invalid name", tc.value)
+			}
+		})
+	}
+}
+
+func TestAddSourceAcceptsValidName(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	s := &registry.Source{Name: "main-1", PGVersion: "17", ConnHost: "h", ConnPort: 5432, ConnUser: "postgres"}
+	if err := e.AddSource(context.Background(), s, "secret"); err != nil {
+		t.Fatalf("AddSource(valid) = %v, want nil", err)
+	}
+	if got, err := r.GetSourceByName("main-1"); err != nil || got.State != registry.SourceReady {
+		t.Fatalf("source after add: %+v err=%v", got, err)
+	}
+}
+
 func TestRemoveSource(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)

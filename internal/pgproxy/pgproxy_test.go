@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -413,21 +414,45 @@ func TestNoDatabaseParamRefused(t *testing.T) {
 	}
 }
 
-func TestUnknownBranchRefused(t *testing.T) {
-	addr := startProxy(t, fakeResolver{"pr-1": local(1)})
-	conn := dialProxy(t, addr)
-	fe := pgproto3.NewFrontend(conn, conn)
-	sendStartup(t, fe, map[string]string{"user": "postgres", "database": "postgres@nope"})
+// notReadyResolver mimics RegistryResolver's not-ready branch: the name
+// exists but resolution fails with a state-revealing error.
+type notReadyResolver struct{}
 
-	er := recvError(t, fe)
-	if er.Code != "3D000" {
-		t.Errorf("code = %q, want 3D000", er.Code)
+func (notReadyResolver) ResolveBranch(name string) (string, error) {
+	return "", fmt.Errorf("branch is creating, not ready")
+}
+
+// A missing branch and a not-ready branch must produce the IDENTICAL
+// client-facing refusal (same SQLSTATE, same generic message, no branch name
+// and no state) so an unauthenticated client cannot enumerate branches.
+func TestRouteRefusalUniformAcrossMissingAndNotReady(t *testing.T) {
+	recv := func(r BranchResolver, db string) *pgproto3.ErrorResponse {
+		addr := startProxy(t, r)
+		conn := dialProxy(t, addr)
+		fe := pgproto3.NewFrontend(conn, conn)
+		sendStartup(t, fe, map[string]string{"user": "postgres", "database": db})
+		return recvError(t, fe)
 	}
-	if !strings.Contains(er.Message, `"nope"`) {
-		t.Errorf("message %q does not name the branch", er.Message)
+	missing := recv(fakeResolver{}, "postgres@nope")
+	notReady := recv(notReadyResolver{}, "postgres@pr-1")
+
+	if missing.Code != "3D000" || notReady.Code != "3D000" {
+		t.Fatalf("codes = (%q, %q), want both 3D000", missing.Code, notReady.Code)
+	}
+	if missing.Message != notReady.Message {
+		t.Fatalf("messages differ: missing=%q notReady=%q (must be identical)", missing.Message, notReady.Message)
+	}
+	if missing.Message != genericRouteRefusal {
+		t.Fatalf("message = %q, want generic %q", missing.Message, genericRouteRefusal)
+	}
+	if strings.Contains(missing.Message, "nope") || strings.Contains(missing.Message, "creating") ||
+		strings.Contains(missing.Message, "ready") {
+		t.Errorf("message %q leaks branch name or state", missing.Message)
 	}
 }
 
+// A resolved-but-unreachable backend collapses into the same generic refusal
+// (no branch name, SQLSTATE 3D000) rather than a distinct 08006.
 func TestBackendDialFailureRefused(t *testing.T) {
 	// resolve to a port nothing listens on
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -443,11 +468,14 @@ func TestBackendDialFailureRefused(t *testing.T) {
 	sendStartup(t, fe, map[string]string{"user": "postgres", "database": "postgres@pr-1"})
 
 	er := recvError(t, fe)
-	if er.Code != "08006" {
-		t.Errorf("code = %q, want 08006", er.Code)
+	if er.Code != "3D000" {
+		t.Errorf("code = %q, want 3D000", er.Code)
 	}
-	if !strings.Contains(er.Message, "pgbranch") {
-		t.Errorf("message %q missing pgbranch prefix", er.Message)
+	if er.Message != genericRouteRefusal {
+		t.Errorf("message = %q, want generic %q", er.Message, genericRouteRefusal)
+	}
+	if strings.Contains(er.Message, "pr-1") {
+		t.Errorf("message %q leaks branch name", er.Message)
 	}
 }
 

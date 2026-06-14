@@ -23,14 +23,32 @@ var ErrInvalidName = errors.New("invalid branch name")
 
 var branchNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
 
+// validateName enforces the cross-runtime naming rule shared by branch and
+// source names: lowercase letters/digits/hyphens, starting with a letter or
+// digit, at most 41 chars. The anchored regex rejects path-traversal payloads
+// (no '/', '.', '..'), uppercase, leading '-', spaces and over-length names —
+// names flow into container/dataset/volume names, so this is the one gate.
+func validateName(kind, name string) error {
+	if !branchNameRe.MatchString(name) {
+		return fmt.Errorf("%w %q: %s name must match [a-z0-9][a-z0-9-]{0,40} (lowercase letters, digits and hyphens, starting with a letter or digit, at most 41 characters)", ErrInvalidName, name, kind)
+	}
+	return nil
+}
+
 // validateBranchName enforces the cross-runtime naming rule on new branches.
 // Stored names (reset/destroy paths) are assumed valid: they passed this
 // check when created.
 func validateBranchName(name string) error {
-	if !branchNameRe.MatchString(name) {
-		return fmt.Errorf("%w %q: must match [a-z0-9][a-z0-9-]{0,40} (lowercase letters, digits and hyphens, starting with a letter or digit, at most 41 characters)", ErrInvalidName, name)
-	}
-	return nil
+	return validateName("branch", name)
+}
+
+// validateSourceName enforces the same anchored naming rule on source names.
+// A source name flows into volume/dataset names (e.g. the ZFS backend builds
+// `tank/pgbranch/src-<name>-gN`), so without this gate a name like
+// `../../rpool/ROOT` would traverse the dataset namespace. Gated at the engine
+// boundary (AddSource) so every backend and caller is covered.
+func validateSourceName(name string) error {
+	return validateName("source", name)
 }
 
 // observeOp brackets a saga entry point: it increments the in-flight gauge,

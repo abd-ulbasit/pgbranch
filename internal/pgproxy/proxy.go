@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strconv"
 	"time"
@@ -19,6 +20,12 @@ import (
 
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 )
+
+// genericRouteRefusal is the single client-facing message for every routing
+// failure (unknown branch, not-ready branch, any resolver error). It is
+// deliberately uniform so an UNAUTHENTICATED client cannot enumerate branch
+// names or distinguish branch state; the real reason is logged server-side.
+const genericRouteRefusal = "pgbranch: database not available"
 
 // BranchResolver maps a branch name to the "host:port" address of its
 // Postgres instance. Implementations must only resolve branches that can
@@ -146,8 +153,10 @@ func (p *Proxy) route(client net.Conn, startup *pgproto3.StartupMessage) {
 	}
 	addr, err := p.Resolver.ResolveBranch(branch)
 	if err != nil {
-		writeRefusal(client, "3D000",
-			fmt.Sprintf("pgbranch: cannot route to branch %q: %v", branch, err))
+		// Uniform refusal: unknown vs not-ready vs any other resolve error are
+		// indistinguishable to the (unauthenticated) client. Real reason logged.
+		slog.Warn("pgproxy: route refused", "branch", branch, "reason", "resolve", "error", err)
+		writeRefusal(client, "3D000", genericRouteRefusal) // invalid_catalog_name
 		return
 	}
 	startup.Parameters["database"] = dbname
@@ -158,8 +167,10 @@ func (p *Proxy) route(client net.Conn, startup *pgproto3.StartupMessage) {
 	}
 	backend, err := net.DialTimeout("tcp", addr, p.DialTimeout)
 	if err != nil {
-		writeRefusal(client, "08006", // connection_failure
-			fmt.Sprintf("pgbranch: branch %q backend unreachable: %v", branch, err))
+		// A resolved-but-unreachable backend would otherwise confirm the branch
+		// name and its (down) state — collapse it into the same generic refusal.
+		slog.Warn("pgproxy: route refused", "branch", branch, "reason", "dial", "addr", addr, "error", err)
+		writeRefusal(client, "3D000", genericRouteRefusal)
 		return
 	}
 	defer backend.Close()
