@@ -74,7 +74,8 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 		provision = func() error { return e.provisionCSI(ctx, child, src) }
 	}
 	if err := provision(); err != nil {
-		e.reg.TransitionBranch(child.ID, registry.BranchFailed, err.Error())
+		e.logCompensationErr("transition", "from_branch: mark child failed after provision failed",
+			e.reg.TransitionBranch(child.ID, registry.BranchFailed, err.Error()), "branch", child.Name, "branch_id", child.ID)
 		return nil, err
 	}
 	return e.reg.GetBranchByName(name)
@@ -106,7 +107,9 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	// 1. CHECKPOINT the parent so the frozen layer is a clean snapshot
 	// needing minimal WAL replay (in-container psql, no password needed).
 	if err := e.drv.Exec(ctx, parent.ContainerID, psqlCmd(src, "CHECKPOINT")); err != nil {
-		e.reg.TransitionBranch(parent.ID, registry.BranchReady, "freeze for child "+child.Name+" aborted: checkpoint failed")
+		e.logCompensationErr("transition", "freeze: restore parent to ready after checkpoint failed",
+			e.reg.TransitionBranch(parent.ID, registry.BranchReady, "freeze for child "+child.Name+" aborted: checkpoint failed"),
+			"branch", parent.Name, "branch_id", parent.ID)
 		return fmt.Errorf("checkpoint parent %q: %w", parent.Name, err)
 	}
 
@@ -115,7 +118,9 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	// failure above leaves it ready and running.
 	if err := e.drv.StopRemove(ctx, parent.ContainerID); err != nil {
 		// container state unknown — don't guess; reconcile/destroy can clean
-		e.reg.TransitionBranch(parent.ID, registry.BranchFailed, "freeze for child "+child.Name+": stop parent failed: "+err.Error())
+		e.logCompensationErr("transition", "freeze: mark parent failed after stop parent failed",
+			e.reg.TransitionBranch(parent.ID, registry.BranchFailed, "freeze for child "+child.Name+": stop parent failed: "+err.Error()),
+			"branch", parent.Name, "branch_id", parent.ID)
 		return fmt.Errorf("stop parent %q: %w", parent.Name, err)
 	}
 
@@ -132,7 +137,10 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	if err := e.drv.CreateVolume(ctx, newRW, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": parent.ID})); err != nil {
 		return fail(fmt.Errorf("create parent rw volume: %w", err))
 	}
-	undo = append(undo, func() { e.drv.RemoveVolume(bg, newRW) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "freeze: remove parent rw volume", e.drv.RemoveVolume(bg, newRW),
+			"branch", parent.Name, "volume", newRW)
+	})
 	if err := e.installOverlayEntrypoint(ctx, newRW); err != nil {
 		return fail(fmt.Errorf("install parent entrypoint: %w", err))
 	}
@@ -143,21 +151,30 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	if err != nil {
 		return fail(fmt.Errorf("restart parent %q: %w", parent.Name, err))
 	}
-	undo = append(undo, func() { e.drv.StopRemove(bg, parentCID) })
-	e.reg.SetBranchContainer(parent.ID, parentCID) // own the in-flight container before the readiness wait (reconcile-safe)
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "freeze: stop/remove restarted parent container", e.drv.StopRemove(bg, parentCID),
+			"branch", parent.Name, "container", parentCID)
+	})
+	e.logCompensationErr("transition", "freeze: own restarted parent container before readiness wait",
+		e.reg.SetBranchContainer(parent.ID, parentCID), "branch", parent.Name, "container", parentCID)
 	if err := e.waitReady(ctx, parentCID, 90*time.Second); err != nil {
 		return fail(fmt.Errorf("parent %q never became ready after freeze: %w", parent.Name, err))
 	}
 	// freeze checkpoint: the parent is back up. Bump both rows' stuck-timer so a
 	// slow child start below does not make either look abandoned to reconcile.
-	e.reg.TouchBranch(parent.ID)
-	e.reg.TouchBranch(child.ID)
+	e.logCompensationErr("transition", "freeze: touch parent stuck-timer", e.reg.TouchBranch(parent.ID),
+		"branch", parent.Name, "branch_id", parent.ID)
+	e.logCompensationErr("transition", "freeze: touch child stuck-timer", e.reg.TouchBranch(child.ID),
+		"branch", child.Name, "branch_id", child.ID)
 
 	// 5. child resources over the same chain
 	if err := e.drv.CreateVolume(ctx, childPlan.RWVolume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": child.ID})); err != nil {
 		return fail(fmt.Errorf("create rw volume: %w", err))
 	}
-	undo = append(undo, func() { e.drv.RemoveVolume(bg, childPlan.RWVolume) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "freeze: remove child rw volume", e.drv.RemoveVolume(bg, childPlan.RWVolume),
+			"branch", child.Name, "volume", childPlan.RWVolume)
+	})
 	if err := e.installOverlayEntrypoint(ctx, childPlan.RWVolume); err != nil {
 		return fail(fmt.Errorf("install entrypoint: %w", err))
 	}
@@ -165,8 +182,12 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
-	undo = append(undo, func() { e.drv.StopRemove(bg, childCID) })
-	e.reg.SetBranchContainer(child.ID, childCID) // own the in-flight container before the readiness wait (reconcile-safe)
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "freeze: stop/remove child container", e.drv.StopRemove(bg, childCID),
+			"branch", child.Name, "container", childCID)
+	})
+	e.logCompensationErr("transition", "freeze: own child container before readiness wait",
+		e.reg.SetBranchContainer(child.ID, childCID), "branch", child.Name, "container", childCID)
 	if err := e.waitReady(ctx, childCID, 90*time.Second); err != nil {
 		return fail(fmt.Errorf("instance never became ready: %w", err))
 	}
@@ -210,19 +231,23 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 // marked failed — its data (the original rw volume) is always preserved.
 func (e *Engine) restoreParent(ctx context.Context, parent *registry.Branch, src *registry.Source, origPlan cow.Plan, cause error) {
 	failed := func(err error) {
-		e.reg.TransitionBranch(parent.ID, registry.BranchFailed,
-			fmt.Sprintf("freeze failed (%v); parent restore failed: %v", cause, err))
+		e.logCompensationErr("transition", "restoreParent: mark parent failed after restore failed",
+			e.reg.TransitionBranch(parent.ID, registry.BranchFailed,
+				fmt.Sprintf("freeze failed (%v); parent restore failed: %v", cause, err)),
+			"branch", parent.Name, "branch_id", parent.ID)
 	}
 	cid, err := e.startOverlayBranch(ctx, parent.Name, origPlan, e.image(src.PGVersion), e.branchLabels(parent))
 	if err == nil {
-		e.reg.SetBranchContainer(parent.ID, cid) // own the in-flight container before the readiness wait
+		e.logCompensationErr("transition", "restoreParent: own restored parent container before readiness wait",
+			e.reg.SetBranchContainer(parent.ID, cid), "branch", parent.Name, "container", cid) // own the in-flight container before the readiness wait
 	}
 	if err != nil {
 		failed(err)
 		return
 	}
 	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
-		e.drv.StopRemove(ctx, cid)
+		e.logCompensationErr("undo", "restoreParent: stop/remove parent container after readiness wait failed",
+			e.drv.StopRemove(ctx, cid), "branch", parent.Name, "container", cid)
 		failed(err)
 		return
 	}
@@ -231,5 +256,6 @@ func (e *Engine) restoreParent(ctx context.Context, parent *registry.Branch, src
 		failed(err)
 		return
 	}
-	e.reg.MarkBranchReady(parent.ID, cid, info.Host, info.Port)
+	e.logCompensationErr("transition", "restoreParent: mark parent ready after restore",
+		e.reg.MarkBranchReady(parent.ID, cid, info.Host, info.Port), "branch", parent.Name, "branch_id", parent.ID)
 }

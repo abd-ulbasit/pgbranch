@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +63,23 @@ func NewWithPlanner(reg *registry.Registry, drv runtime.Driver, defaultImage str
 	return e
 }
 
+// logCompensationErr surfaces a swallowed best-effort error: a saga
+// compensation (undo: RemoveVolume/StopRemove), a post-failure state
+// transition (transition: TransitionBranch(..., Failed)/TouchBranch), or a
+// deferred cleanup (cleanup: throwaway DestroyBranch). It does NOT change
+// control flow — the caller still proceeds best-effort; this only makes the
+// failure observable via a slog.Warn and the compensation-failures counter.
+// kind is the metric label (transition|undo|cleanup). Extra attrs (e.g.
+// "branch", name, "rw_volume", vol) are appended to the log line. nil err is a
+// no-op so call sites can pass results unconditionally.
+func (e *Engine) logCompensationErr(kind, msg string, err error, attrs ...any) {
+	if err == nil {
+		return
+	}
+	e.metrics.IncCompensationFailure(kind)
+	slog.Warn(msg, append(attrs, "kind", kind, "err", err)...)
+}
+
 func (e *Engine) image(pgVersion string) string {
 	if pgVersion == "" {
 		return e.defaultImage
@@ -93,12 +111,15 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 		return err
 	}
 	if err := e.createSourceLayer(ctx, s.Volume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": s.Name})); err != nil {
-		e.reg.SetSourceState(s.ID, registry.SourceFailed, "source layer create failed")
+		e.logCompensationErr("transition", "add source: mark source failed after layer create failed",
+			e.reg.SetSourceState(s.ID, registry.SourceFailed, "source layer create failed"), "source", s.Name)
 		return err
 	}
 	if err := e.seedSource(ctx, s, s.Volume, password); err != nil {
-		e.removeSourceLayer(context.WithoutCancel(ctx), s.Volume)
-		e.reg.SetSourceState(s.ID, registry.SourceFailed, err.Error())
+		e.logCompensationErr("undo", "add source: remove source layer after seed failed",
+			e.removeSourceLayer(context.WithoutCancel(ctx), s.Volume), "source", s.Name, "volume", s.Volume)
+		e.logCompensationErr("transition", "add source: mark source failed after seed failed",
+			e.reg.SetSourceState(s.ID, registry.SourceFailed, err.Error()), "source", s.Name)
 		return fmt.Errorf("seed source %q: %w", s.Name, err)
 	}
 	return e.reg.SetSourceState(s.ID, registry.SourceReady, "seed complete")

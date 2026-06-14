@@ -35,6 +35,7 @@ type Metrics struct {
 	reconcileRuns prometheus.Counter       // pgbranch_reconcile_runs_total
 	reconcileActs *prometheus.CounterVec   // pgbranch_reconcile_actions_total{action}
 	inflight      prometheus.Gauge         // pgbranch_inflight_ops
+	compFailures  *prometheus.CounterVec   // pgbranch_compensation_failures_total{kind}
 }
 
 // New builds a Metrics over its own registry. The branch/source gauges are
@@ -76,10 +77,15 @@ func New() *Metrics {
 			Name: "pgbranch_inflight_ops",
 			Help: "Branch operations currently in flight.",
 		}),
+		compFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgbranch_compensation_failures_total",
+			Help: "Best-effort saga compensation/failure-transition errors by kind (transition|undo|cleanup).",
+		}, []string{"kind"}),
 	}
 	m.reg.MustRegister(
 		m.opDuration, m.opErrors, m.maskingDur,
 		m.reaperRuns, m.reaperReaped, m.reconcileRuns, m.reconcileActs, m.inflight,
+		m.compFailures,
 	)
 	return m
 }
@@ -166,4 +172,14 @@ func (m *Metrics) DecInflight() {
 		return
 	}
 	m.inflight.Dec()
+}
+
+// IncCompensationFailure counts one best-effort compensation/failure-transition
+// error by kind (transition|undo|cleanup). These are swallowed at the call site
+// (cleanup proceeds best-effort) but surfaced here for alerting on leaks.
+func (m *Metrics) IncCompensationFailure(kind string) {
+	if m == nil {
+		return
+	}
+	m.compFailures.WithLabelValues(kind).Inc()
 }

@@ -76,7 +76,8 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 		return nil, err
 	}
 	if err := e.provision(ctx, b, src); err != nil {
-		e.reg.TransitionBranch(b.ID, registry.BranchFailed, err.Error())
+		e.logCompensationErr("transition", "create: mark branch failed after provision failed",
+			e.reg.TransitionBranch(b.ID, registry.BranchFailed, err.Error()), "branch", b.Name, "branch_id", b.ID)
 		return nil, err
 	}
 	return e.reg.GetBranchByName(name)
@@ -117,7 +118,10 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	if err := e.drv.CreateVolume(ctx, plan.RWVolume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": b.ID})); err != nil {
 		return fail(fmt.Errorf("create rw volume: %w", err))
 	}
-	undo = append(undo, func() { e.drv.RemoveVolume(bg, plan.RWVolume) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provision: remove rw volume", e.drv.RemoveVolume(bg, plan.RWVolume),
+			"branch", b.Name, "volume", plan.RWVolume)
+	})
 
 	// 2. write entrypoint into the rw volume
 	if err := e.installOverlayEntrypoint(ctx, plan.RWVolume); err != nil {
@@ -129,7 +133,10 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
-	undo = append(undo, func() { e.drv.StopRemove(bg, cid) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provision: stop/remove branch container", e.drv.StopRemove(bg, cid),
+			"branch", b.Name, "container", cid)
+	})
 
 	// 4-6. readiness, masking, mark ready
 	if err := e.awaitAndMark(ctx, b, src, cid); err != nil {
@@ -204,13 +211,21 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	if err := e.runZFS(ctx, zfsHelperSpec(e.planner.ZFSSnapshot(b.SourceVolume, b.Name))); err != nil {
 		return fail(fmt.Errorf("zfs snapshot: %w", err))
 	}
-	undo = append(undo, func() { e.runZFS(bg, zfsDestroySpec(e.planner.ZFSDestroySnapshot(b.SourceVolume, b.Name))) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provisionZFS: destroy snapshot",
+			e.runZFS(bg, zfsDestroySpec(e.planner.ZFSDestroySnapshot(b.SourceVolume, b.Name))),
+			"branch", b.Name, "source_volume", b.SourceVolume)
+	})
 
 	// 2. clone it into the branch's writable dataset
 	if err := e.runZFS(ctx, zfsHelperSpec(e.planner.ZFSClone(b.SourceVolume, b.Name))); err != nil {
 		return fail(fmt.Errorf("zfs clone: %w", err))
 	}
-	undo = append(undo, func() { e.runZFS(bg, zfsDestroySpec(e.planner.ZFSDestroyClone(b.Name))) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provisionZFS: destroy clone",
+			e.runZFS(bg, zfsDestroySpec(e.planner.ZFSDestroyClone(b.Name))),
+			"branch", b.Name, "rw_volume", b.RWVolume)
+	})
 
 	// 3. install the zfs entrypoint into the clone, next to its data/ dir
 	// (plain unprivileged helper: it only writes a file)
@@ -236,7 +251,10 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
-	undo = append(undo, func() { e.drv.StopRemove(bg, cid) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provisionZFS: stop/remove branch container", e.drv.StopRemove(bg, cid),
+			"branch", b.Name, "container", cid)
+	})
 
 	if err := e.awaitAndMark(ctx, b, src, cid); err != nil {
 		return fail(err)
@@ -366,7 +384,8 @@ func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Bran
 		return nil, err
 	}
 	fail := func(stepErr error) (*registry.Branch, error) {
-		e.reg.TransitionBranch(b.ID, registry.BranchFailed, stepErr.Error())
+		e.logCompensationErr("transition", "reset: mark branch failed after reset step failed",
+			e.reg.TransitionBranch(b.ID, registry.BranchFailed, stepErr.Error()), "branch", b.Name, "branch_id", b.ID)
 		return nil, stepErr
 	}
 	if b.ContainerID != "" {

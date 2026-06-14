@@ -66,6 +66,9 @@ func TestCounterAndGaugeHelpers(t *testing.T) {
 	m.IncInflight()
 	m.IncInflight()
 	m.DecInflight()
+	m.IncCompensationFailure("undo")
+	m.IncCompensationFailure("undo")
+	m.IncCompensationFailure("transition")
 
 	if v := testutil.ToFloat64(m.opErrors.WithLabelValues("reset")); v != 1 {
 		t.Fatalf("opErrors=%v want 1", v)
@@ -85,6 +88,28 @@ func TestCounterAndGaugeHelpers(t *testing.T) {
 	if v := testutil.ToFloat64(m.inflight); v != 1 {
 		t.Fatalf("inflight=%v want 1", v)
 	}
+	if v := testutil.ToFloat64(m.compFailures.WithLabelValues("undo")); v != 2 {
+		t.Fatalf("compFailures{undo}=%v want 2", v)
+	}
+	if v := testutil.ToFloat64(m.compFailures.WithLabelValues("transition")); v != 1 {
+		t.Fatalf("compFailures{transition}=%v want 1", v)
+	}
+}
+
+// TestCompensationFailureRegistered asserts the counter is registered on the
+// private registry and gathers under its declared name with the kind label.
+func TestCompensationFailureRegistered(t *testing.T) {
+	m := New()
+	m.IncCompensationFailure("cleanup")
+	want := `
+# HELP pgbranch_compensation_failures_total Best-effort saga compensation/failure-transition errors by kind (transition|undo|cleanup).
+# TYPE pgbranch_compensation_failures_total counter
+pgbranch_compensation_failures_total{kind="cleanup"} 1
+`
+	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want),
+		"pgbranch_compensation_failures_total"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // All methods on a nil *Metrics must be no-ops (engine code calls them
@@ -99,5 +124,6 @@ func TestNilReceiverIsNoOp(t *testing.T) {
 	m.IncReconcileAction("gc_volume")
 	m.IncInflight()
 	m.DecInflight()
+	m.IncCompensationFailure("undo")
 	m.SetStateCounter(fakeStateCounter{})
 }
