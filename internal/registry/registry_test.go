@@ -903,3 +903,118 @@ func TestInstanceIDDistinctAcrossFiles(t *testing.T) {
 		t.Fatalf("distinct registry files share an instance id: %q", ra.InstanceID())
 	}
 }
+
+// SetBranchContainer must bump updated_at so a freeze/clone saga that records
+// its in-flight container keeps resetting the stuck-timer. Without the bump a
+// slow-but-alive op looks abandoned to ListStuckBranches and reconcile reaps
+// it (the freeze data-loss bug).
+func TestSetBranchContainerBumpsUpdatedAt(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "v"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	b := &Branch{Name: "parent", SourceID: s.ID, RWVolume: "pgbranch-br-parent-rw"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	// Backdate updated_at well into the past so the row looks stuck.
+	old := "2000-01-01T00:00:00.000Z"
+	if _, err := r.db.Exec(`UPDATE branches SET state='resetting', updated_at=? WHERE id=?`, old, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: with the old timestamp it IS flagged stuck.
+	stuck, err := r.ListStuckBranches("2020-01-01T00:00:00.000Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stuck) != 1 {
+		t.Fatalf("precondition: backdated row should be stuck, got %d", len(stuck))
+	}
+
+	// Saga progress records the in-flight container — this must bump updated_at.
+	if err := r.SetBranchContainer(b.ID, "cid-inflight"); err != nil {
+		t.Fatal(err)
+	}
+
+	var updatedAt string
+	if err := r.db.QueryRow(`SELECT updated_at FROM branches WHERE id=?`, b.ID).Scan(&updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if updatedAt == old {
+		t.Fatal("SetBranchContainer did not bump updated_at")
+	}
+	// And it is no longer flagged stuck against a recent-past deadline.
+	stuck, err = r.ListStuckBranches("2020-01-01T00:00:00.000Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stuck) != 0 {
+		t.Fatalf("progressing branch still flagged stuck after SetBranchContainer: %d", len(stuck))
+	}
+}
+
+// CountLiveBranchesReferencingRW guards the stuck-fail path: a freeze/clone
+// parent's rw volume is referenced by its in-flight child (as source_volume in
+// csi/zfs, or via parent_branch_name in the overlay freeze) and must never be
+// counted as removable while that child is live.
+func TestCountLiveBranchesReferencingRW(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	parent := &Branch{Name: "parent", SourceID: s.ID, RWVolume: "pgbranch-br-parent-rw", SourceVolume: "pgbranch-src-main"}
+	if err := r.CreateBranch(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkBranchReady(parent.ID, "cid-parent", "127.0.0.1", 5432); err != nil {
+		t.Fatal(err)
+	}
+	// No child yet: nothing references the parent's rw volume.
+	if n, err := r.CountLiveBranchesReferencingRW(parent.Name, parent.RWVolume); err != nil || n != 0 {
+		t.Fatalf("n=%d err=%v want 0", n, err)
+	}
+
+	// csi/zfs child: records parent.RWVolume as its source_volume.
+	csiChild := &Branch{Name: "csichild", SourceID: s.ID, RWVolume: "pgbranch-br-csichild-rw",
+		SourceVolume: parent.RWVolume, ParentBranchName: parent.Name}
+	if err := r.CreateBranch(csiChild); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.CountLiveBranchesReferencingRW(parent.Name, parent.RWVolume); err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v want 1 (csi child references rw via source_volume)", n, err)
+	}
+
+	// overlay child: source_volume is the SOURCE, not the parent rw; the link
+	// is parent_branch_name. Still must count.
+	overlayChild := &Branch{Name: "ovchild", SourceID: s.ID, RWVolume: "pgbranch-br-ovchild-rw",
+		SourceVolume: "pgbranch-src-main", ParentBranchName: parent.Name}
+	if err := r.CreateBranch(overlayChild); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.CountLiveBranchesReferencingRW(parent.Name, parent.RWVolume); err != nil || n != 2 {
+		t.Fatalf("n=%d err=%v want 2 (overlay child references parent by name)", n, err)
+	}
+
+	// the parent must not count itself.
+	if n, err := r.CountLiveBranchesReferencingRW(parent.Name, parent.RWVolume); err != nil || n != 2 {
+		t.Fatalf("parent counted itself: n=%d", n)
+	}
+
+	// destroyed children no longer count.
+	for _, c := range []*Branch{csiChild, overlayChild} {
+		if err := r.TransitionBranch(c.ID, BranchFailed, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.TransitionBranch(c.ID, BranchDestroying, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.TransitionBranch(c.ID, BranchDestroyed, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := r.CountLiveBranchesReferencingRW(parent.Name, parent.RWVolume); err != nil || n != 0 {
+		t.Fatalf("n=%d err=%v want 0 after children destroyed", n, err)
+	}
+}

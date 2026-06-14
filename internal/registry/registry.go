@@ -348,8 +348,23 @@ func (r *Registry) SetBranchPassword(id, password string) error {
 // state. Provisioning calls this as soon as the container is started — before
 // the readiness wait — so a concurrent reconcile sees the in-flight container
 // as owned (in its "known" set) and does not reap it as an orphan.
+//
+// It also bumps updated_at: recording the in-flight container is saga progress,
+// so a slow-but-alive create/freeze keeps resetting the stuck-timer (otherwise
+// ListStuckBranches flags a legitimately slow op as abandoned — and a freeze
+// parent's live data is then reaped). TouchBranch is the standalone bump for
+// freeze checkpoints that don't change the container.
 func (r *Registry) SetBranchContainer(id, containerID string) error {
-	_, err := r.db.Exec(`UPDATE branches SET container_id=? WHERE id=?`, containerID, id)
+	_, err := r.db.Exec(`UPDATE branches SET container_id=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, containerID, id)
+	return err
+}
+
+// TouchBranch bumps a branch's updated_at without any other change: a saga
+// progress checkpoint that resets the stuck-timer. The freeze saga calls it at
+// its major waypoints (after the parent restart, after the child start) so a
+// long-but-progressing freeze never looks abandoned to ListStuckBranches.
+func (r *Registry) TouchBranch(id string) error {
+	_, err := r.db.Exec(`UPDATE branches SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, id)
 	return err
 }
 
@@ -554,6 +569,23 @@ func (r *Registry) CountLiveBranchesByVolume(volume string) (int, error) {
 func (r *Registry) CountLiveBranchesByRWVolume(volume string) (int, error) {
 	var n int
 	err := r.db.QueryRow(`SELECT count(*) FROM branches WHERE rw_volume=? AND state!='destroyed'`, volume).Scan(&n)
+	return n, err
+}
+
+// CountLiveBranchesReferencingRW counts live branches (other than the named
+// branch itself) that still depend on the given branch's writable volume — the
+// guard the stuck-fail path uses to never delete a freeze/clone parent's live
+// data while a child is mid-provision. A child references the parent's rw
+// volume either directly, as its source_volume (csi/zfs clone the parent's
+// PVC/dataset), or — in the overlay freeze, where the child's source_volume is
+// the source and the parent's old rw volume only becomes a layer at
+// CommitFreeze — by naming the parent in parent_branch_name. Either link
+// counts: while it holds, the volume is live data, not a removable orphan.
+func (r *Registry) CountLiveBranchesReferencingRW(branchName, rwVolume string) (int, error) {
+	var n int
+	err := r.db.QueryRow(`SELECT count(*) FROM branches
+		WHERE state!='destroyed' AND name!=? AND (source_volume=? OR parent_branch_name=?)`,
+		branchName, rwVolume, branchName).Scan(&n)
 	return n, err
 }
 

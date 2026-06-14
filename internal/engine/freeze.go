@@ -148,6 +148,10 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	if err := e.waitReady(ctx, parentCID, 90*time.Second); err != nil {
 		return fail(fmt.Errorf("parent %q never became ready after freeze: %w", parent.Name, err))
 	}
+	// freeze checkpoint: the parent is back up. Bump both rows' stuck-timer so a
+	// slow child start below does not make either look abandoned to reconcile.
+	e.reg.TouchBranch(parent.ID)
+	e.reg.TouchBranch(child.ID)
 
 	// 5. child resources over the same chain
 	if err := e.drv.CreateVolume(ctx, childPlan.RWVolume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": child.ID})); err != nil {
